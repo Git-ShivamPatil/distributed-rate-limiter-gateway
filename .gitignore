@@ -1,0 +1,17 @@
+# binaries
+/bin/
+*.exe
+*.test
+*.out
+
+# env
+.env
+.env.local
+
+# editors
+.vscode/
+.idea/
+
+# bench output
+/results/*.json
+!/results/.gitkeep
