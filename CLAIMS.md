@@ -8,7 +8,6 @@ Every number published about this project — in [its README](README.md), on the
 |---|---|
 | **Advertised on the portfolio** | `45K req/s · <8ms p99` |
 | **Substantiated so far** | nothing yet |
-| **Feasibility assessment** | `yes-with-specific-hardware` |
 
 ## Measurements
 
