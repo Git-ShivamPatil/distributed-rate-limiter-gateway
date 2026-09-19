@@ -15,3 +15,6 @@
 # bench output
 /results/*.json
 !/results/.gitkeep
+
+# local cluster state from scripts/cluster-up.sh
+/.cluster/

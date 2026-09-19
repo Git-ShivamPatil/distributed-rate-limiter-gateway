@@ -5,10 +5,10 @@
 **Multi-tenant gateway · token-bucket and sliding-window quotas · consistent-hash shard ring · Raft election over shard failure**
 
 ![status](https://img.shields.io/badge/status-in_development-111111?style=flat-square)
-![progress](https://img.shields.io/badge/milestones-4_of_9-4a4a4a?style=flat-square)
+![progress](https://img.shields.io/badge/milestones-5_of_9-4a4a4a?style=flat-square)
 ![licence](https://img.shields.io/badge/licence-MIT-767676?style=flat-square)
 
-![Go](https://img.shields.io/badge/Go-1.27--000000?style=flat-square&logo=go&logoColor=white)
+![Go](https://img.shields.io/badge/Go-1.27-000000?style=flat-square&logo=go&logoColor=white)
 ![Redis](https://img.shields.io/badge/Redis-7-000000?style=flat-square&logo=redis&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-000000?style=flat-square&logo=postgresql&logoColor=white)
 
@@ -19,7 +19,7 @@
 ---
 
 > [!IMPORTANT]
-> **4 of 9 milestones complete.** It is a gateway now, not only a limiter: it authenticates, routes, limits and proxies, and answers the same questions over gRPC. Replicas sharing one Redis enforce **one** quota between them; tenants, policies and API keys live in Postgres and can be changed while it runs. `45K req/s · <8ms p99` is a target, not a measurement; nothing is benchmarked yet. Every number lands in [CLAIMS.md](CLAIMS.md) first, with its commit, host and caveat.
+> **5 of 9 milestones complete.** A gateway, not only a limiter: it authenticates, routes, limits and proxies, and answers over REST and gRPC. Replicas sharing one Redis enforce **one** quota between them, a consistent-hash ring decides which node coordinates each tenant, and policies live in Postgres and can be changed while it runs. `45K req/s · <8ms p99` is a target, not a measurement; nothing is benchmarked yet. Every number lands in [CLAIMS.md](CLAIMS.md) first, with its commit, host and caveat.
 
 ## Problem
 
@@ -51,6 +51,7 @@ limiter that silently stops limiting is worse than one that will not boot.
 | `GET /healthz` `/readyz` | is this process up, and can it still reach its stores |
 | `GET /api/...` | the data path: authenticate, limit, then proxy to the upstream |
 | `:9090` | `Check`, `GetQuota` and a decision stream; reflection is on |
+| `GET /v1/cluster` | this node's view of the ring, and who owns a given tenant |
 | `/admin/v1/...` | tenants, policies and API keys, behind an admin token |
 | `gatewayctl` | `migrate up`, `apikey create`, `counters reset` |
 
@@ -112,6 +113,37 @@ the smoke test asserts both halves against a real echo service. Per-endpoint
 rules apply here using the method and path the gateway can actually see, which
 is why `POST /api/orders` can be capped separately from everything else.
 
+### The ring, and what it is not for
+
+```bash
+scripts/cluster-up.sh 3        # three nodes, one ring, one Redis
+scripts/show-ownership.sh acme # every node has to name the same owner
+scripts/cluster-down.sh
+```
+
+A tenant is coordinated by one node. Ownership is a consistent hash of the
+**tenant id alone** — not of (tenant, limit), which would spread load better
+and quietly give a tenant with three limits three owners — with 256 virtual
+nodes per member so the shares come out even. Removing one of N nodes remaps
+fewer than 1.5/N of the keyspace, and a key owned by a node that stayed never
+moves; both are property tests over 100,000 synthetic tenants. Changing a
+node's *address* moves nothing at all, because the ring hashes ids.
+
+**What the ring does not do is decide admissions.** Counters live in Redis and
+every admission is backed by an atomic script there, so two nodes briefly
+disagreeing about who owns a tenant cannot over-admit — the worst it costs is
+a hop. That is deliberate, and it is what makes losing a node a latency event
+rather than a capacity gap: a forward that fails is decided locally instead,
+against the same store, and the fallback is counted so an operator can see the
+ring is unhealthy.
+
+It also means one claim needs two pieces of evidence, which
+`scripts/cluster-quota-test.sh` keeps separate: that three nodes admit
+**exactly** one quota between them (which would still hold with the ring
+removed), and that forwarding **actually happened** (which is the only thing
+that shows the ring is doing anything). The answer names the owner and says it
+was forwarded; the nodes' own counters have to agree.
+
 ## Architecture
 
 ```mermaid
@@ -147,13 +179,13 @@ Raft governs **membership and ring ownership only**, never per-request counters 
 
 ## Roadmap
 
-`[███████████░░░░░░░░░░░░░] 4/9` — ticked only when the verification step passes, not when the code is written.
+`[█████████████░░░░░░░░░░░] 5/9` — ticked only when the verification step passes, not when the code is written.
 
 - [x] **M1 · Skeleton, config, single-node token bucket that says 429** — one process enforces an in-memory per-tenant bucket over REST, on the advertised config path and flags.
 - [x] **M2 · Redis-backed token bucket and sliding window** — both strategies as single-round-trip atomic Lua; two processes sharing one Redis enforce one quota.
 - [x] **M3 · Postgres policy store, tenant auth, hot-reloading cache** — per-tenant and per-endpoint policies in Postgres, served from an in-process cache; `make migrate` works as advertised.
 - [x] **M4 · gRPC contract and the actual gateway data path** — authenticates, routes, applies policy and proxies upstream; same decisions over gRPC.
-- [ ] **M5 · Consistent-hash ring with cross-node forwarding** — a tenant always lands on the same shard; a node that does not own it forwards over gRPC.
+- [x] **M5 · Consistent-hash ring with cross-node forwarding** — a tenant always lands on the same shard; a node that does not own it forwards over gRPC.
 - [ ] **M6 · Raft membership and leader election** — ring ownership survives a node dying; enforcement continues with quota accuracy across the rebalance.
 - [ ] **M7 · Prometheus, Grafana, live React dashboard** — every decision observable; per-tenant headroom exactly as advertised.
 - [ ] **M8 · Benchmark harness and honest tuning** — a defensible throughput and p99 on real hardware, methodology written down, or the claim corrected.

@@ -29,7 +29,39 @@ type Config struct {
 	Policy   PolicyStore `yaml:"policy"`
 	Auth     Auth        `yaml:"auth"`
 	CheckAPI CheckAPI    `yaml:"check_api"`
+	Cluster  Cluster     `yaml:"cluster"`
 	Routes   []Route     `yaml:"routes"`
+}
+
+// Cluster is the ring this node belongs to.
+//
+// With no members the node is alone and answers for every tenant itself, which
+// is the single-node deployment and what every test that does not care about
+// the ring runs. With members, a tenant's checks are coordinated by whichever
+// node the ring picks, and requests that arrive elsewhere are forwarded there.
+//
+// Membership is static here. Milestone 6 replaces the source with a
+// Raft-committed one; the shape does not change.
+type Cluster struct {
+	Members []Member `yaml:"members"`
+	// VNodes is how many points each node occupies on the ring. Zero uses the
+	// ring package's default. Every node must agree, or they compute different
+	// rings from the same membership.
+	VNodes int `yaml:"vnodes"`
+	// ForwardTimeout bounds one forwarded check. A forward that has not
+	// answered by then has already cost more than deciding locally would have.
+	ForwardTimeout time.Duration `yaml:"forward_timeout"`
+	// ForwardPoolSize is how many connections are held per peer.
+	ForwardPoolSize int `yaml:"forward_pool_size"`
+}
+
+// Member is one node of the ring.
+type Member struct {
+	// ID is what the ring hashes, so it must be stable across restarts. An
+	// address can change without moving a single tenant.
+	ID string `yaml:"id"`
+	// Addr is this member's gRPC address, which is where forwards go.
+	Addr string `yaml:"addr"`
 }
 
 // Route sends matching requests to an upstream, after the limiter has decided.
@@ -276,6 +308,9 @@ func (c Config) Validate() error {
 	if err := validateRoutes(c.Routes); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
+	if err := c.validateCluster(); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
 
 	seen := map[string]bool{}
 	for name, p := range c.Policies.Named {
@@ -317,6 +352,47 @@ func (c Config) Validate() error {
 		if _, ok := c.Policies.Named[policy]; !ok {
 			return fmt.Errorf("config: tenant %q names policy %q, which is not defined", tenant, policy)
 		}
+	}
+	return nil
+}
+
+// validateCluster rejects a ring this node could not take part in.
+func (c Config) validateCluster() error {
+	if len(c.Cluster.Members) == 0 {
+		return nil // alone, which is a valid deployment
+	}
+	seenID := map[string]bool{}
+	seenAddr := map[string]bool{}
+	self := false
+	for _, m := range c.Cluster.Members {
+		if m.ID == "" {
+			return fmt.Errorf("cluster: a member has no id")
+		}
+		if m.Addr == "" {
+			return fmt.Errorf("cluster: member %q has no addr, so nothing could forward to it", m.ID)
+		}
+		if seenID[m.ID] {
+			return fmt.Errorf("cluster: two members share the id %q", m.ID)
+		}
+		if seenAddr[m.Addr] {
+			// Two members on one address means one process answering as two
+			// nodes, which makes the ring's ownership meaningless.
+			return fmt.Errorf("cluster: two members share the address %q", m.Addr)
+		}
+		seenID[m.ID], seenAddr[m.Addr] = true, true
+		if m.ID == c.Node.ID {
+			self = true
+		}
+	}
+	if !self {
+		return fmt.Errorf("cluster: node.id %q is not in the member list, so this node would forward every request away, including its own tenants",
+			c.Node.ID)
+	}
+	if c.Cluster.VNodes < 0 {
+		return fmt.Errorf("cluster: vnodes must not be negative")
+	}
+	if c.Cluster.ForwardTimeout < 0 {
+		return fmt.Errorf("cluster: forward_timeout must not be negative")
 	}
 	return nil
 }

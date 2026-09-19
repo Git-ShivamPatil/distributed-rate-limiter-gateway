@@ -80,6 +80,11 @@ func (s *Server) Check(ctx context.Context, req *ratelimitv1.CheckRequest) (*rat
 		Method: req.GetMethod(),
 		Path:   req.GetPath(),
 		Cost:   req.GetCost(),
+		// A call that another node forwarded here is decided here, whatever
+		// this node believes about ownership. Without that, two nodes with
+		// momentarily different views of the ring would bounce it between
+		// them until a deadline expired.
+		Forwarded: isForwardedHop(ctx),
 	})
 	if err != nil {
 		return nil, s.statusFor(err, tenant)
@@ -94,10 +99,11 @@ func (s *Server) GetQuota(ctx context.Context, req *ratelimitv1.GetQuotaRequest)
 		return nil, err
 	}
 	out, err := s.decider.Decide(ctx, decide.Query{
-		Tenant: tenant,
-		Method: req.GetMethod(),
-		Path:   req.GetPath(),
-		Peek:   true,
+		Tenant:    tenant,
+		Method:    req.GetMethod(),
+		Path:      req.GetPath(),
+		Peek:      true,
+		Forwarded: isForwardedHop(ctx),
 	})
 	if err != nil {
 		return nil, s.statusFor(err, tenant)
@@ -169,6 +175,19 @@ func (s *Server) tenant(ctx context.Context, field string) (string, error) {
 	return "", status.Error(codes.InvalidArgument, "tenant_id is required")
 }
 
+// isForwardedHop reports whether another node sent this call.
+//
+// The header name is defined by the forwarding package, but reading it here
+// rather than importing that package keeps the dependency pointing one way:
+// forward imports decide, and the server imports neither's internals.
+func isForwardedHop(ctx context.Context) bool {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return false
+	}
+	return firstValue(md, "x-ratelimit-hop") != ""
+}
+
 func firstValue(md metadata.MD, keys ...string) string {
 	for _, k := range keys {
 		if v := md.Get(k); len(v) > 0 && v[0] != "" {
@@ -202,6 +221,12 @@ func (s *Server) statusFor(err error, tenant string) error {
 }
 
 func quotaOf(tenant, node string, out decide.Outcome) *ratelimitv1.Quota {
+	// The node that actually decided, which is not this one when the answer
+	// came back from an owner. "Which node decided this" is the first question
+	// when two replicas seem to disagree.
+	if out.Forwarded && out.Owner != "" {
+		node = out.Owner
+	}
 	q := &ratelimitv1.Quota{
 		Allowed:    out.Result.Allowed,
 		TenantId:   tenant,

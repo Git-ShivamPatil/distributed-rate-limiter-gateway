@@ -20,6 +20,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/auth"
+	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/cluster"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/config"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/decide"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter"
@@ -42,6 +43,7 @@ type Server struct {
 	ready   func(context.Context) error
 
 	proxy      *Proxy
+	cluster    *cluster.View
 	authn      *auth.Authenticator
 	admin      AdminStore
 	adminToken *auth.AdminToken
@@ -56,6 +58,9 @@ func WithAuth(a *auth.Authenticator) Option { return func(s *Server) { s.authn =
 
 // WithProxy enables the data path for the configured routes.
 func WithProxy(p *Proxy) Option { return func(s *Server) { s.proxy = p } }
+
+// WithCluster supplies the ring view that /v1/cluster reports.
+func WithCluster(v *cluster.View) Option { return func(s *Server) { s.cluster = v } }
 
 // WithAdmin enables the management API over a writable store, behind a token.
 func WithAdmin(store AdminStore, token *auth.AdminToken) Option {
@@ -98,6 +103,7 @@ func New(cfg config.Config, decider *decide.Service, log *slog.Logger, opts ...O
 	r.Route("/v1", func(r chi.Router) {
 		r.Get("/check", s.handleCheck)
 		r.Post("/check", s.handleCheck)
+		r.Get("/cluster", s.handleCluster)
 	})
 	s.mountAdmin(r)
 
@@ -142,14 +148,58 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready", "node": s.cfg.Node.ID})
 }
 
+// handleCluster reports this node's view of the ring, and optionally who owns
+// a particular tenant.
+//
+// It exists so that "which node owns acme" has one answer a person can ask for
+// rather than being inferred from logs -- and so the same question can be put
+// to every node, which is how a disagreement is spotted.
+func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
+	if s.cluster == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"self":    s.cfg.Node.ID,
+			"members": []any{},
+			"note":    "this node is not in a ring; it answers for every tenant itself",
+		})
+		return
+	}
+
+	body := map[string]any{"cluster": s.cluster.Describe()}
+	if tenant := r.URL.Query().Get("tenant"); tenant != "" {
+		owner, isSelf, ok := s.cluster.Owner(tenant)
+		if ok {
+			body["tenant"] = tenant
+			body["owner"] = owner.ID
+			body["owner_addr"] = owner.Addr
+			body["owner_is_self"] = isSelf
+		}
+	}
+	if s.decider != nil {
+		st := s.decider.Stats()
+		body["decisions"] = map[string]int64{
+			"local":     st.Local,
+			"forwarded": st.Forwarded,
+			"fell_back": st.FellBack,
+		}
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
 // checkResponse is the decision API's body. It names every limit that was
 // evaluated, not just the one that refused, because "which of my limits am I
 // closest to" is the question a caller actually has.
 type checkResponse struct {
-	Allowed      bool            `json:"allowed"`
-	Tenant       string          `json:"tenant"`
-	Policy       string          `json:"policy"`
-	Node         string          `json:"node"`
+	Allowed bool   `json:"allowed"`
+	Tenant  string `json:"tenant"`
+	Policy  string `json:"policy"`
+	// Node is the node that ANSWERED, which is this one.
+	Node string `json:"node"`
+	// Owner is the node that coordinates this tenant, and Forwarded says
+	// whether the answer came from there. Both are in the response because
+	// "which node decided this" is the first question when two replicas seem
+	// to disagree.
+	Owner        string          `json:"owner,omitempty"`
+	Forwarded    bool            `json:"forwarded,omitempty"`
 	Route        string          `json:"route,omitempty"`
 	Limits       []limitResponse `json:"limits"`
 	Limiting     string          `json:"limiting,omitempty"`
@@ -232,12 +282,14 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) responseFor(tenant string, out decide.Outcome) checkResponse {
 	body := checkResponse{
-		Allowed:  out.Result.Allowed,
-		Tenant:   tenant,
-		Policy:   out.Policy.Name,
-		Node:     s.cfg.Node.ID,
-		Limits:   make([]limitResponse, 0, len(out.Result.Decisions)),
-		Limiting: out.Result.Limiting,
+		Allowed:   out.Result.Allowed,
+		Tenant:    tenant,
+		Policy:    out.Policy.Name,
+		Node:      s.cfg.Node.ID,
+		Owner:     out.Owner,
+		Forwarded: out.Forwarded,
+		Limits:    make([]limitResponse, 0, len(out.Result.Decisions)),
+		Limiting:  out.Result.Limiting,
 	}
 	for _, d := range out.Result.Decisions {
 		body.Limits = append(body.Limits, limitResponse{

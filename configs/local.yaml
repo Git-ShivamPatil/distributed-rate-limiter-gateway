@@ -92,6 +92,27 @@ check_api:
   # tenant and spend its quota. Credentials, when present, always win.
   trust_tenant_header: true
 
+cluster:
+  # No members: this node is alone and answers for every tenant itself, which
+  # is what a single `go run ./cmd/gateway` should do.
+  #
+  # Fill this in and the node joins a ring: a tenant's checks are coordinated
+  # by whichever member the ring picks, and requests arriving anywhere else are
+  # forwarded there. Every node needs the SAME list -- the ring is computed
+  # from the ids alone, so a node with a different list computes a different
+  # ring. `scripts/cluster-up.sh 3` writes these files for you.
+  #
+  #   vnodes: 256
+  #   forward_timeout: 250ms
+  #   members:
+  #     - id: gateway-1
+  #       addr: "127.0.0.1:19101"
+  #     - id: gateway-2
+  #       addr: "127.0.0.1:19102"
+  #     - id: gateway-3
+  #       addr: "127.0.0.1:19103"
+  members: []
+
 routes:
   # The data path. A request matching a route is limited first and forwarded
   # only if it is admitted, so a tenant over its quota costs the upstream

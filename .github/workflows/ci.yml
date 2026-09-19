@@ -209,6 +209,43 @@ jobs:
       - name: policy reload
         run: ./scripts/policy-reload-test.sh
 
+  cluster:
+    name: Three nodes, one ring, one quota
+    runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: gateway
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gateway"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # Checks both claims separately: that the quota is shared (which would
+      # hold even with the ring removed, because Redis is authoritative) and
+      # that forwarding actually happened (which is the only thing that shows
+      # the ring is doing anything).
+      - name: cluster quota
+        run: ./scripts/cluster-quota-test.sh
+
   case-study:
     name: The commands the case study publishes
     runs-on: ubuntu-24.04

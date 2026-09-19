@@ -27,14 +27,17 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/auth"
+	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/cluster"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/config"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/decide"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/events"
+	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/forward"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/gateway"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/grpcapi"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter"
 	redislimiter "github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter/redis"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/policy"
+	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/ring"
 )
 
 func main() {
@@ -170,7 +173,18 @@ func run(args []string) error {
 	// One decision service behind both surfaces. REST and gRPC translate; they
 	// do not decide.
 	hub := events.NewHub(events.DefaultBuffer)
-	decider := decide.New(checker, policies, cfg.Node.ID, decide.WithHub(hub))
+	decideOpts := []decide.Option{decide.WithHub(hub), decide.WithLogger(log)}
+
+	view, forwarder, err := buildRing(cfg, log)
+	if err != nil {
+		return err
+	}
+	if view != nil {
+		decideOpts = append(decideOpts, decide.WithRing(view, forwarder))
+		defer func() { _ = forwarder.Close() }()
+	}
+
+	decider := decide.New(checker, policies, cfg.Node.ID, decideOpts...)
 
 	serverOpts := []gateway.Option{
 		gateway.WithReadiness(ready),
@@ -181,6 +195,9 @@ func run(args []string) error {
 	}
 	if adminStore != nil {
 		serverOpts = append(serverOpts, gateway.WithAdmin(adminStore, adminToken))
+	}
+	if view != nil {
+		serverOpts = append(serverOpts, gateway.WithCluster(view))
 	}
 	if len(cfg.Routes) > 0 {
 		proxy, err := gateway.NewProxy(cfg.Routes, log)
@@ -236,6 +253,39 @@ func run(args []string) error {
 	}
 	log.Info("stopped", "node", cfg.Node.ID)
 	return nil
+}
+
+// buildRing assembles this node's view of the cluster and the client that
+// forwards to its peers.
+//
+// A configuration with no members is a single node, which answers for every
+// tenant itself. That is not a degraded mode: correctness never depended on
+// the ring, only coordination does.
+func buildRing(cfg config.Config, log *slog.Logger) (*cluster.View, *forward.Client, error) {
+	if len(cfg.Cluster.Members) == 0 {
+		log.Info("no ring configured; this node answers for every tenant itself")
+		return nil, nil, nil
+	}
+
+	members := make([]ring.Node, 0, len(cfg.Cluster.Members))
+	for _, m := range cfg.Cluster.Members {
+		members = append(members, ring.Node{ID: m.ID, Addr: m.Addr})
+	}
+	view, err := cluster.New(cfg.Node.ID, members, cfg.Cluster.VNodes)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	fwd := forward.New(
+		forward.WithTimeout(cfg.Cluster.ForwardTimeout),
+		forward.WithPoolSize(cfg.Cluster.ForwardPoolSize),
+	)
+
+	dist := view.Ring().Distribution()
+	log.Info("ring configured",
+		"members", len(members), "vnodes", view.Ring().VNodes(),
+		"epoch", view.Epoch(), "own_points", dist[cfg.Node.ID])
+	return view, fwd, nil
 }
 
 // serveGRPC starts the Limiter service and returns a function that stops it.
