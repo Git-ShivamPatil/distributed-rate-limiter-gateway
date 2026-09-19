@@ -22,6 +22,8 @@ cd "$(dirname "$0")/.." || exit 1
 
 PORT_A="${PORT_A:-18092}"
 PORT_B="${PORT_B:-18093}"
+GRPC_A="${GRPC_A:-19192}"
+GRPC_B="${GRPC_B:-19193}"
 URL_A="http://127.0.0.1:${PORT_A}"
 URL_B="http://127.0.0.1:${PORT_B}"
 ADMIN_TOKEN="policy-reload-test-token"
@@ -76,9 +78,14 @@ check_api:
 YAML
 }
 
-start_node() { # $1 = config, $2 = port, $3 = node id -> echoes pid
+start_node() { # $1 = config, $2 = port, $3 = node id, $4 = grpc port -> echoes pid
+  # Each node needs its own gRPC port as well as its own HTTP one: the config
+  # names a single address and two processes on one host cannot share it.
+  # Without this the second node exits with "address already in use", which is
+  # the right behaviour and a broken test.
   GATEWAY_ADMIN_TOKEN="${ADMIN_TOKEN}" \
-    "${BIN}" --node="$3" --config="$1" --http-addr="127.0.0.1:$2" >>"${WORK}/$3.log" 2>&1 &
+    "${BIN}" --node="$3" --config="$1" --http-addr="127.0.0.1:$2" \
+    --grpc-addr="127.0.0.1:$4" >>"${WORK}/$3.log" 2>&1 &
   local pid=$!
   for _ in $(seq 1 60); do
     if curl -fsS --max-time 1 "http://127.0.0.1:$2/healthz" >/dev/null 2>&1; then
@@ -159,8 +166,8 @@ run_phase() { # $1 = listen_for_changes on node B, $2 = expected admitted after 
   write_config "${WORK}/a.yaml" true
   write_config "${WORK}/b.yaml" "${listen}"
 
-  PID_A=$(start_node "${WORK}/a.yaml" "${PORT_A}" node-a) || return 1
-  PID_B=$(start_node "${WORK}/b.yaml" "${PORT_B}" node-b) || return 1
+  PID_A=$(start_node "${WORK}/a.yaml" "${PORT_A}" node-a "${GRPC_A}") || return 1
+  PID_B=$(start_node "${WORK}/b.yaml" "${PORT_B}" node-b "${GRPC_B}") || return 1
 
   set_policy "${policy}" 5 || return 1
   local code

@@ -22,9 +22,23 @@ REQUESTS=2000
 REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:6379}"
 PORT_A="${PORT_A:-18090}"
 PORT_B="${PORT_B:-18091}"
-# A quota that does not refill during the run, so "exactly the quota" means
-# exactly the quota rather than "the quota plus whatever refilled".
+# Two nodes on one host need two of every port. The config names one gRPC
+# address, so each process gets its own on the command line -- without this the
+# second node fails to start with "address already in use", which is correct
+# behaviour and a broken test.
+GRPC_A="${GRPC_A:-19190}"
+GRPC_B="${GRPC_B:-19191}"
+# A quota whose refill cannot interfere, so "exactly the quota" means exactly
+# the quota rather than "the quota plus whatever refilled while we counted".
+#
+# 500 per DAY is one token every 172.8 seconds. An earlier version used 500 per
+# hour -- one token every 7.2 seconds -- and a 1000-request loop simply outran
+# it: the run admitted 502 and reported an over-admission that was really a
+# refill. The elapsed guard in run_split fails the run if it ever gets close
+# again, rather than letting the number drift.
 QUOTA=500
+PERIOD=24h
+EMISSION_SECONDS=172
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -37,6 +51,14 @@ while [ $# -gt 0 ]; do
     *) echo "dual-node-quota: unknown argument $1" >&2; exit 2 ;;
   esac
 done
+
+# Fewer requests than the quota cannot observe a refusal, so the run would
+# report "not exactly the quota" while measuring nothing at all.
+if [ "${REQUESTS}" -le "${QUOTA}" ]; then
+  echo "dual-node-quota: --requests ${REQUESTS} must exceed the quota of ${QUOTA}," >&2
+  echo "  or neither node ever refuses and the assertion means nothing." >&2
+  exit 2
+fi
 
 WORK="$(mktemp -d -t dual-node-XXXXXX)"
 PID_A=""
@@ -72,7 +94,7 @@ policies:
         - name: quota
           algorithm: token_bucket
           count: ${QUOTA}
-          period: 1h
+          period: ${PERIOD}
           burst: ${QUOTA}
 check_api:
   trust_tenant_header: true
@@ -80,9 +102,9 @@ YAML
 }
 
 start_pair() { # $1 = config
-  "${BIN}" --node=node-a --config="$1" --http-addr="127.0.0.1:${PORT_A}" >>"${WORK}/a.log" 2>&1 &
+  "${BIN}" --node=node-a --config="$1" --http-addr="127.0.0.1:${PORT_A}"     --grpc-addr="127.0.0.1:${GRPC_A}" >>"${WORK}/a.log" 2>&1 &
   PID_A=$!
-  "${BIN}" --node=node-b --config="$1" --http-addr="127.0.0.1:${PORT_B}" >>"${WORK}/b.log" 2>&1 &
+  "${BIN}" --node=node-b --config="$1" --http-addr="127.0.0.1:${PORT_B}"     --grpc-addr="127.0.0.1:${GRPC_B}" >>"${WORK}/b.log" 2>&1 &
   PID_B=$!
 
   for port in "${PORT_A}" "${PORT_B}"; do
@@ -103,13 +125,23 @@ start_pair() { # $1 = config
 # Fires REQUESTS requests alternating between the two nodes and prints how many
 # were admitted in total.
 run_split() { # $1 = tenant
-  local tenant="$1" allowed=0 code port
+  local tenant="$1" allowed=0 code port started elapsed
+  started=${SECONDS}
   for i in $(seq 1 "${REQUESTS}"); do
     if [ $((i % 2)) -eq 0 ]; then port="${PORT_A}"; else port="${PORT_B}"; fi
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
       -H "X-Tenant-ID: ${tenant}" "http://127.0.0.1:${port}/v1/check")
     if [ "${code}" = "200" ]; then allowed=$((allowed + 1)); fi
   done
+  elapsed=$((SECONDS - started))
+  if [ "${elapsed}" -ge "${EMISSION_SECONDS}" ]; then
+    # A token refilled while we were counting, so an exact total no longer
+    # means anything. Say so, rather than reporting a refill as an
+    # over-admission and sending somebody hunting for a race.
+    echo "INCONCLUSIVE: the loop took ${elapsed}s, longer than the ${EMISSION_SECONDS}s between tokens" >&2
+    echo "-1"
+    return
+  fi
   echo "${allowed}"
 }
 

@@ -137,7 +137,11 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
-go run ./cmd/gatewayctl counters reset --config ./configs/local.yaml --tenant proxy-demo >/dev/null || exit 1
+# acme was just driven to exhaustion by the burst above, and its bucket refills
+# at one token per three seconds. Whether a token had arrived by now depends on
+# how fast this machine is -- which is not what this section is testing, and is
+# exactly how it failed on a runner quicker than the development box. Reset it.
+go run ./cmd/gatewayctl counters reset --config ./configs/local.yaml --tenant acme >/dev/null || exit 1
 
 proxied=$(curl -s --max-time 5 -H 'X-Tenant-ID: acme' -H 'Authorization: Bearer not-for-the-upstream' \
   "${URL}/api/echo/hello")
@@ -155,15 +159,28 @@ if ! echo "${proxied}" | grep -q '"saw_authorization":false'; then
   fail=1
 fi
 
-# acme is exhausted by now, so proxied requests for it must be refused at the
-# gateway rather than forwarded.
+# One token of acme's 20 went on the request above, so 30 more must be split
+# 19 admitted and 11 refused -- and the refusals must be refused AT THE
+# GATEWAY. Counting both sides rather than only the refusals is what makes
+# this fail if the limiter stopped applying on the proxy path.
+allowed=0
 denied=0
+other=0
 for _ in $(seq 1 30); do
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'X-Tenant-ID: acme' "${URL}/api/echo")
-  if [ "${code}" = "429" ]; then denied=$((denied + 1)); fi
+  case "${code}" in
+    200) allowed=$((allowed + 1)) ;;
+    429) denied=$((denied + 1)) ;;
+    *)   other=$((other + 1)) ;;
+  esac
 done
-if [ "${denied}" -eq 0 ]; then
-  echo "FAIL: 30 proxied requests on an exhausted tenant produced no refusals" >&2
+echo "proxied: ${allowed} forwarded, ${denied} refused, ${other} other"
+if [ "${other}" -ne 0 ]; then
+  echo "FAIL: ${other} proxied requests answered with neither 200 nor 429" >&2
+  fail=1
+fi
+if [ "${denied}" -lt 5 ]; then
+  echo "FAIL: only ${denied} of 30 proxied requests were refused; the limiter is not applying on the data path" >&2
   fail=1
 fi
 
