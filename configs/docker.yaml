@@ -14,7 +14,7 @@ node:
   shutdown_grace: 10s
 
 limiter:
-  backend: memory
+  backend: redis
   sweep_interval: 30s
 
 redis:

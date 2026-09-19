@@ -121,29 +121,49 @@ func (l Limit) Capacity() int64 {
 	return l.Count
 }
 
-// emission is the time one unit of quota takes to accrue.
+// Quantum is the resolution every limiter works at.
 //
-// It rounds UP, deliberately. Rounding down would make the effective rate
-// slightly faster than the configured one, and a limiter that admits more than
-// it was told to is a worse failure than one that admits fractionally fewer.
-// The error is under one nanosecond per token.
-func (l Limit) emission() time.Duration {
+// One microsecond, and not one nanosecond, because the Redis implementation
+// does its arithmetic in Lua, whose numbers are float64. A nanosecond Unix
+// timestamp is about 1.8e18 and float64 stops representing consecutive
+// integers above 2^53 (9.0e15), so nanosecond timestamps in Lua would be
+// silently rounded -- the sort of error that shows up as a rate limiter that
+// is mysteriously 3% generous. Microsecond timestamps are exact until the year
+// 287396, and both implementations use the same unit so their arithmetic
+// agrees bit for bit. That is what makes them differentially testable.
+const Quantum = time.Microsecond
+
+// Emission is the time one unit of quota takes to accrue.
+//
+// It rounds UP to the next whole quantum, deliberately. Rounding down would
+// make the effective rate faster than the configured one, and a limiter that
+// admits more than it was told to is a worse failure than one that admits
+// fractionally fewer. The cost is that a limit whose period does not divide
+// evenly by its count is enforced slightly slowly: 45,000 per second wants
+// 22.22us per token and gets 23us, which is 3.4% under. Limits at that rate
+// belong to the benchmark rather than to a tenant, and the direction of the
+// error is the safe one.
+func (l Limit) Emission() time.Duration {
 	n := time.Duration(l.Count)
 	e := l.Period / n
 	if l.Period%n != 0 {
 		e++
 	}
-	if e < 1 {
-		e = 1
+	if r := e % Quantum; r != 0 {
+		e += Quantum - r
+	}
+	if e < Quantum {
+		e = Quantum
 	}
 	return e
 }
 
-// tolerance is the GCRA delay-variation tolerance: how far ahead of now the
+// Tolerance is the GCRA delay-variation tolerance: how far ahead of now the
 // theoretical arrival time may sit before a request is refused. It is exactly
-// Capacity worth of emission intervals, which is what makes the burst exact.
-func (l Limit) tolerance() time.Duration {
-	return l.emission() * time.Duration(l.Capacity())
+// Capacity worth of emission intervals, which is what makes the burst exact --
+// and why it is derived from Emission rather than rounded separately.
+func (l Limit) Tolerance() time.Duration {
+	return l.Emission() * time.Duration(l.Capacity())
 }
 
 // fingerprint distinguishes counters whose parameters differ.

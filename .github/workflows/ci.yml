@@ -47,6 +47,21 @@ jobs:
   test:
     name: Tests (race)
     runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    env:
+      REDIS_ADDR: 127.0.0.1:6379
+      # Without this, a runner with no Redis would SKIP the differential test
+      # against the Lua script and still report the suite green -- the failure
+      # mode where CI passes because the interesting tests did not run.
+      REDIS_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -61,6 +76,15 @@ jobs:
   smoke:
     name: Smoke (real process, real socket)
     runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -69,6 +93,29 @@ jobs:
           cache: true
       - name: gateway smoke
         run: ./scripts/gateway-smoke.sh
+
+  dual-node:
+    name: Two nodes, one Redis, one quota
+    runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # Runs the shared-quota scenario and, as its control, the same scenario
+      # with per-process counters -- which is required to over-admit.
+      - name: dual-node quota
+        run: ./scripts/dual-node-quota.sh --requests 1000
 
   case-study:
     name: The commands the case study publishes

@@ -3,6 +3,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,14 +34,34 @@ type Server struct {
 	policies policy.Source
 	log      *slog.Logger
 	router   chi.Router
+	ready    func(context.Context) error
+}
+
+// Option configures a Server.
+type Option func(*Server)
+
+// WithReadiness supplies the check behind /readyz -- typically a round trip to
+// the counter store. It is deliberately separate from /healthz: liveness asks
+// whether this process is working, readiness asks whether it can enforce
+// anything, and a load balancer that cannot tell them apart will either keep
+// restarting a healthy gateway or keep sending traffic to one that is failing
+// every check closed.
+func WithReadiness(fn func(context.Context) error) Option {
+	return func(s *Server) { s.ready = fn }
 }
 
 // New builds the server and its routes.
-func New(cfg config.Config, checker limiter.Checker, policies policy.Source, log *slog.Logger) *Server {
+func New(cfg config.Config, checker limiter.Checker, policies policy.Source, log *slog.Logger, opts ...Option) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
 	s := &Server{cfg: cfg, checker: checker, policies: policies, log: log}
+	for _, o := range opts {
+		o(s)
+	}
+	if s.ready == nil {
+		s.ready = func(context.Context) error { return nil }
+	}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -48,6 +69,7 @@ func New(cfg config.Config, checker limiter.Checker, policies policy.Source, log
 	r.Use(middleware.Recoverer)
 
 	r.Get("/healthz", s.handleHealth)
+	r.Get("/readyz", s.handleReady)
 	r.Route("/v1", func(r chi.Router) {
 		r.Get("/check", s.handleCheck)
 		r.Post("/check", s.handleCheck)
@@ -68,6 +90,20 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ok"}` + "\n"))
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.ready(ctx); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "not ready",
+			"reason": err.Error(),
+			"node":   s.cfg.Node.ID,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready", "node": s.cfg.Node.ID})
 }
 
 // checkResponse is the decision API's body. It names every limit that was

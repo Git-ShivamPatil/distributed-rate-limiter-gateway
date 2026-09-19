@@ -162,14 +162,54 @@ func TestGCRAExpiryEqualsFullBucket(t *testing.T) {
 	}
 }
 
-// Rounding is conservative: the effective rate never exceeds the configured one.
-func TestGCRAEmissionRoundsUp(t *testing.T) {
-	// 3 per second does not divide evenly into nanoseconds.
-	l := tokenBucket(3, time.Second, 3)
-	if got, want := l.emission(), 333_333_334*time.Nanosecond; got != want {
-		t.Fatalf("emission = %s, want %s (rounded up, so the rate is never faster than asked)", got, want)
+// Rounding is conservative: the effective rate never exceeds the configured
+// one, and everything lands on a whole microsecond so that the Go and Lua
+// implementations do identical arithmetic.
+func TestGCRAEmissionRoundsUpToWholeMicroseconds(t *testing.T) {
+	cases := []struct {
+		limit Limit
+		want  time.Duration
+	}{
+		{tokenBucket(20, time.Minute, 20), 3 * time.Second},               // divides evenly
+		{tokenBucket(3, time.Second, 3), 333_334 * time.Microsecond},      // 333333.33us -> 333334us
+		{tokenBucket(45_000, time.Second, 45_000), 23 * time.Microsecond}, // 22.22us -> 23us
 	}
-	if l.emission()*3 < time.Second {
-		t.Fatal("three emission intervals are shorter than the period: the effective rate is too fast")
+	for _, c := range cases {
+		got := c.limit.Emission()
+		if got != c.want {
+			t.Errorf("%d per %s: emission = %s, want %s", c.limit.Count, c.limit.Period, got, c.want)
+		}
+		if got%Quantum != 0 {
+			t.Errorf("%d per %s: emission %s is not a whole number of microseconds", c.limit.Count, c.limit.Period, got)
+		}
+		if got*time.Duration(c.limit.Count) < c.limit.Period {
+			t.Errorf("%d per %s: the emission intervals fit inside the period, so the effective rate is too fast",
+				c.limit.Count, c.limit.Period)
+		}
+	}
+}
+
+// The burst stays exact under that rounding, because the tolerance is built
+// from the rounded emission rather than rounded separately.
+func TestGCRAToleranceIsWholeEmissions(t *testing.T) {
+	l := tokenBucket(45_000, time.Second, 100)
+	if l.Tolerance() != l.Emission()*100 {
+		t.Fatalf("tolerance %s is not 100 emissions of %s", l.Tolerance(), l.Emission())
+	}
+
+	now := time.Unix(1_700_000_000, 0)
+	var tat time.Time
+	allowed := 0
+	for i := 0; i < 200; i++ {
+		var d Decision
+		var ok bool
+		tat, d = gcraCheck(l, tat, now, 1)
+		ok = d.Allowed
+		if ok {
+			allowed++
+		}
+	}
+	if allowed != 100 {
+		t.Fatalf("a burst of %d was admitted against a capacity of 100 at a rate that does not divide evenly", allowed)
 	}
 }

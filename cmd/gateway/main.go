@@ -20,9 +20,12 @@ import (
 	"syscall"
 	"time"
 
+	goredis "github.com/redis/go-redis/v9"
+
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/config"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/gateway"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter"
+	redislimiter "github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter/redis"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/policy"
 )
 
@@ -97,17 +100,50 @@ func run(args []string) error {
 		return err
 	}
 
-	mem := limiter.NewMemory(limiter.WithMaxKeys(cfg.Limiter.MaxKeys))
-	var checker limiter.Checker = mem
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var (
+		checker limiter.Checker
+		mem     *limiter.Memory
+		ready   func(context.Context) error
+	)
 	switch cfg.Limiter.Backend {
 	case "memory":
+		mem = limiter.NewMemory(limiter.WithMaxKeys(cfg.Limiter.MaxKeys))
+		checker = mem
+		ready = func(context.Context) error { return nil }
 		log.Warn("limiter backend is memory: counters are per-process, so N replicas admit N times the quota",
 			"node", cfg.Node.ID)
 	case "redis":
-		return fmt.Errorf("limiter.backend redis is not implemented yet (milestone 2); use memory")
+		client := goredis.NewClient(&goredis.Options{
+			Addr:         cfg.Redis.Addr,
+			Password:     cfg.Redis.Password,
+			DB:           cfg.Redis.DB,
+			PoolSize:     cfg.Redis.PoolSize,
+			DialTimeout:  cfg.Redis.Timeout,
+			ReadTimeout:  cfg.Redis.Timeout,
+			WriteTimeout: cfg.Redis.Timeout,
+		})
+		defer func() { _ = client.Close() }()
+
+		rc := redislimiter.New(client)
+		// Fail at startup rather than on the first request: a gateway that
+		// starts happily and then refuses everything because Redis was never
+		// reachable is harder to diagnose than one that will not start.
+		startCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := rc.Load(startCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("%w (is the data plane up? `docker compose up -d redis postgres`)", err)
+		}
+		checker = rc
+		ready = rc.Ping
+		log.Info("limiter backend is redis: replicas sharing this Redis enforce one quota",
+			"addr", cfg.Redis.Addr, "pool_size", cfg.Redis.PoolSize)
 	}
 
-	srv := gateway.New(cfg, checker, policies, log)
+	srv := gateway.New(cfg, checker, policies, log, gateway.WithReadiness(ready))
 
 	httpSrv := &http.Server{
 		Addr:         cfg.Node.HTTPAddr,
@@ -116,12 +152,10 @@ func run(args []string) error {
 		WriteTimeout: cfg.Node.WriteTimeout,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	// Discarding expired counters is memory management, not admission: a
-	// counter is only dropped once its state is identical to having none.
-	if cfg.Limiter.SweepInterval > 0 {
+	// counter is only dropped once its state is identical to having none. The
+	// Redis backend gets the same rule from the key TTL the script sets.
+	if mem != nil && cfg.Limiter.SweepInterval > 0 {
 		go sweep(ctx, mem, cfg.Limiter.SweepInterval, log)
 	}
 

@@ -14,14 +14,21 @@ node:
   shutdown_grace: 10s
 
 limiter:
-  # memory: counters live in this process, so two replicas each enforce the
-  # whole limit -- fine for one node, wrong for a cluster. Milestone 2 moves
-  # this to redis, which is what makes the quota shared.
-  backend: memory
+  # redis: counters live in Redis, so every replica enforces ONE quota. The
+  # alternative, `memory`, keeps them in the process -- fine for a single node,
+  # and wrong for a cluster, where N replicas would each admit the whole limit.
+  #
+  # This is why `docker compose up -d redis postgres` comes first: the gateway
+  # refuses to start if it cannot load its script into Redis.
+  backend: redis
   sweep_interval: 30s
 
 redis:
-  addr: "localhost:6379"
+  # 127.0.0.1 rather than localhost, deliberately. On a dual-stack machine
+  # `localhost` resolves to ::1 first, and anything holding the IPv6 socket --
+  # a container port forwarder, say -- will accept the connection and then
+  # never answer, which surfaces as an i/o timeout rather than as a refusal.
+  addr: "127.0.0.1:6379"
   pool_size: 64
   timeout: 250ms
 

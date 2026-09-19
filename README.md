@@ -5,10 +5,10 @@
 **Multi-tenant gateway · token-bucket and sliding-window quotas · consistent-hash shard ring · Raft election over shard failure**
 
 ![status](https://img.shields.io/badge/status-in_development-111111?style=flat-square)
-![progress](https://img.shields.io/badge/milestones-0_of_9-4a4a4a?style=flat-square)
+![progress](https://img.shields.io/badge/milestones-2_of_9-4a4a4a?style=flat-square)
 ![licence](https://img.shields.io/badge/licence-MIT-767676?style=flat-square)
 
-![Go](https://img.shields.io/badge/Go-1.23+-000000?style=flat-square&logo=go&logoColor=white)
+![Go](https://img.shields.io/badge/Go-1.27--000000?style=flat-square&logo=go&logoColor=white)
 ![Redis](https://img.shields.io/badge/Redis-7-000000?style=flat-square&logo=redis&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-000000?style=flat-square&logo=postgresql&logoColor=white)
 
@@ -19,7 +19,7 @@
 ---
 
 > [!IMPORTANT]
-> **0 of 9 milestones complete.** There is working code below, but no milestone has passed its verification step yet — see [what runs today](#run-what-exists-today) for exactly what does and does not exist. `45K req/s · <8ms p99` is a target, not a measurement; nothing is benchmarked yet. Every number lands in [CLAIMS.md](CLAIMS.md) first, with its commit, host and caveat.
+> **2 of 9 milestones complete.** A node enforces per-tenant quotas over REST, and replicas sharing one Redis enforce **one** quota between them rather than one each. `45K req/s · <8ms p99` is a target, not a measurement; nothing is benchmarked yet. Every number lands in [CLAIMS.md](CLAIMS.md) first, with its commit, host and caveat.
 
 ## Problem
 
@@ -27,39 +27,46 @@ Keep per-tenant quotas accurate across replicas while a noisy neighbour, a lost 
 
 ## Run what exists today
 
-Working code, but not yet a milestone. What exists: an in-memory token bucket, an in-memory
-sliding-window log, a Redis-backed token bucket driven by one atomic Lua script, and HTTP
-middleware that returns 429 with `Retry-After`.
-
-What the milestones below still ask for and this does **not** have: the `--node` / `--config`
-flags and `configs/local.yaml` the case study advertises, a `/v1/check` endpoint, a Redis
-sliding window, Redis `TIME` as the clock source (today's script is handed the *gateway's*
-clock, which drifts between replicas), a policy store, and CI.
-
-Tests need no containers — the Redis-backed limiter is covered by an in-process fake:
-
 ```bash
-go test ./...                                                   # tests
-go run ./cmd/gateway                                            # in-memory limiter, per-replica counts
-docker compose up -d redis && RATE_LIMIT_BACKEND=redis REDIS_ADDR=localhost:6379 go run ./cmd/gateway
-docker compose up --build                                       # whole stack
+docker compose up -d redis postgres                                   # 1. the data plane
+go run ./cmd/gateway --node gateway-1 --config ./configs/local.yaml   # 2. a node
+curl -si -H 'X-Tenant-ID: acme' localhost:8080/v1/check               # 3. a decision
 ```
 
-On PowerShell, set the environment first — it has no inline env-var prefix:
+Thirty of those curls against the shipped 20-token bucket return exactly twenty
+`200`s and then ten `429`s, each carrying `Retry-After` and the `X-RateLimit-*`
+headers. The gateway refuses to start if it cannot reach Redis, because a
+limiter that silently stops limiting is worse than one that will not boot.
 
-```powershell
-$env:RATE_LIMIT_BACKEND = "redis"; $env:REDIS_ADDR = "localhost:6379"; go run ./cmd/gateway
-```
+| | |
+|---|---|
+| `--node` | this node's identity — from milestone 5 it decides which tenants it owns |
+| `--config` | the YAML above; an unknown key is a startup error, not a silent no-op |
+| `--http-addr` | overrides the listen address for a second local node |
+| `GET /v1/check` | the decision: `200` or `429`, every evaluated limit in the body |
+| `GET /healthz` `/readyz` | is this process up, and can it still reach its counter store |
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `GATEWAY_ADDR` | `:8080` | listen address |
-| `RATE_LIMIT_BACKEND` | `memory` | `memory` or `redis` |
-| `RATE_LIMIT_ALGORITHM` | `token_bucket` | `token_bucket` or `sliding_window` (memory backend only) |
-| `REDIS_ADDR` | `localhost:6379` | Redis address (redis backend only) |
-| `RATE_LIMIT_CAPACITY` | `20` | token bucket burst size |
-| `RATE_LIMIT_REFILL_PER_SEC` | `5` | token bucket steady-state rate |
-| `RATE_LIMIT_MAX_REQUESTS` | `20` | sliding window: max requests per window |
+**Two algorithms.** A token bucket, stored as GCRA — one timestamp rather than a
+`(tokens, last_refill)` pair, which makes a full bucket and an absent key the
+same state, so key expiry can never hand out quota. And an exact sliding-window
+log: at most N requests in *any* window, including across a boundary where a
+fixed-window counter admits 2N. A policy may carry both, and a request refused
+by either consumes from neither.
+
+**One quota across replicas.** The whole decision is a single Lua script and a
+single round trip, and it reads Redis's own `TIME` rather than any gateway's
+clock — replicas drift, and a sliding window evaluated against two different
+"now"s admits a different number of requests depending on which replica
+answers.
+
+**What proves it.** `scripts/dual-node-quota.sh` runs two gateway processes
+against one Redis and requires the combined admissions to equal the quota
+*exactly*; then it runs the same scenario with per-process counters as a
+control, which is **required to over-admit**. A check that cannot fail when the
+mechanism is removed is not evidence that the mechanism works. The Lua script
+is also differentially tested against the Go implementation over several
+thousand random operations — both driven by one clock, required to agree on
+every field of every decision.
 
 ## Architecture
 
@@ -88,7 +95,7 @@ Raft governs **membership and ring ownership only**, never per-request counters 
 
 ## Scope
 
-**Dual limiting strategies.** Token-bucket for smooth burst control, sliding-window counters for stricter endpoint policies. Both are single-round-trip atomic Lua, so two gateway processes sharing one Redis enforce one quota, not two.
+**Dual limiting strategies.** Token-bucket for smooth burst control, an exact sliding-window log for stricter endpoint policies. Both are single-round-trip atomic Lua, so two gateway processes sharing one Redis enforce one quota, not two.
 
 **Resilient control plane.** Consistent-hash sharding keeps a tenant on a stable shard; Raft promotes a replacement leader on failure, with quota accuracy preserved across the rebalance.
 
@@ -96,23 +103,23 @@ Raft governs **membership and ring ownership only**, never per-request counters 
 
 ## Roadmap
 
-`[░░░░░░░░░░░░░░░░░░░░░░░░] 0/9` — ticked only when the verification step passes, not when the code is written.
+`[█████░░░░░░░░░░░░░░░░░░░] 2/9` — ticked only when the verification step passes, not when the code is written.
 
-- [ ] **M1 · Skeleton, config, single-node token bucket that says 429** — one process enforces an in-memory per-tenant bucket over REST, on the advertised config path and flags.
-- [ ] **M2 · Redis-backed token bucket and sliding window** — both strategies as single-round-trip atomic Lua; two processes sharing one Redis enforce one quota.
+- [x] **M1 · Skeleton, config, single-node token bucket that says 429** — one process enforces an in-memory per-tenant bucket over REST, on the advertised config path and flags.
+- [x] **M2 · Redis-backed token bucket and sliding window** — both strategies as single-round-trip atomic Lua; two processes sharing one Redis enforce one quota.
 - [ ] **M3 · Postgres policy store, tenant auth, hot-reloading cache** — per-tenant and per-endpoint policies in Postgres, served from an in-process cache; `make migrate` works as advertised.
 - [ ] **M4 · gRPC contract and the actual gateway data path** — authenticates, routes, applies policy and proxies upstream; same decisions over gRPC.
 - [ ] **M5 · Consistent-hash ring with cross-node forwarding** — a tenant always lands on the same shard; a node that does not own it forwards over gRPC.
 - [ ] **M6 · Raft membership and leader election** — ring ownership survives a node dying; enforcement continues with quota accuracy across the rebalance.
 - [ ] **M7 · Prometheus, Grafana, live React dashboard** — every decision observable; per-tenant headroom exactly as advertised.
 - [ ] **M8 · Benchmark harness and honest tuning** — a defensible throughput and p99 on real hardware, methodology written down, or the claim corrected.
-- [ ] **M9 · AKS deployment and chaos under load** — the whole stack on AKS, surviving a pod deletion mid-load.
+- [ ] **M9 · Kubernetes deployment and chaos under load** — the whole stack on a cluster, surviving a pod deletion mid-load.
 
 The benchmark needs a **separate Linux load-generation host**: k6 runs a JS VM per VU and will steal the cores it is measuring, and the figure is an aggregate across 3–4 replicas, not per-replica. Both go in the report or the number is doing work it did not earn.
 
 ## Stack
 
-`Go 1.23+` `gRPC (buf + protoc-gen-go-grpc)` `chi` `Redis 7 (Lua, go-redis v9)` `PostgreSQL 16 (pgx + golang-migrate)` `hashicorp/raft + raft-boltdb` `consistent hashing with virtual nodes` `Prometheus + Grafana` `React 18 + Vite + TypeScript` `Docker Compose` `Kubernetes + AKS + ACR (Helm)` `k6 (constant-arrival-rate) + wrk2` `GitHub Actions`
+`Go 1.27` `gRPC (buf + protoc-gen-go-grpc)` `chi` `Redis 7 (Lua, go-redis v9)` `PostgreSQL 16 (pgx + golang-migrate)` `hashicorp/raft + raft-boltdb` `consistent hashing with virtual nodes` `Prometheus + Grafana` `React 18 + Vite + TypeScript` `Docker Compose` `Kubernetes (Helm, verified on kind in CI)` `k6 (constant-arrival-rate) + wrk2` `GitHub Actions`
 
 ## Commands
 

@@ -26,8 +26,8 @@ import "time"
 // the TAT to store (unchanged when the request is refused, because a refused
 // request must not consume quota) and the decision.
 func gcraCheck(l Limit, tat, now time.Time, cost int64) (time.Time, Decision) {
-	emission := l.emission()
-	tolerance := l.tolerance()
+	emission := l.Emission()
+	tolerance := l.Tolerance()
 	capacity := l.Capacity()
 
 	// An empty or stale TAT is a full bucket.

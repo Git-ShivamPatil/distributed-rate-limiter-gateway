@@ -12,9 +12,12 @@
 #
 # Two phases, deliberately:
 #
-#   1. the shipped configs/local.yaml, reproducing the case study's own numbers
+#   1. the shipped configs/local.yaml, reproducing the case study's own numbers.
+#      It uses the redis backend, so this phase needs a Redis -- which is the
+#      point: the shipped config is the shared-quota one.
 #   2. scripts/testdata/smoke.yaml, whose limits refill over an hour, so the
-#      header and refusal assertions cannot depend on how fast this machine is
+#      header and refusal assertions cannot depend on how fast this machine is.
+#      It uses the memory backend, so both backends get exercised here.
 #
 set -uo pipefail
 
@@ -76,6 +79,15 @@ go build -o "${BIN}" ./cmd/gateway || exit 1
 echo
 echo "=== phase 1: the shipped config ==="
 start_gateway ./configs/local.yaml smoke-shipped || exit 1
+
+# The shipped config must be the shared-quota one. A gateway that quietly fell
+# back to per-process counters would pass every assertion below and be wrong in
+# exactly the way this project exists to avoid.
+if ! grep -q 'limiter backend is redis' "${LOG}"; then
+  echo "FAIL: the shipped config did not start on the redis backend" >&2
+  cat "${LOG}" >&2
+  fail=1
+fi
 
 # 20 tokens per minute is one token every 3 seconds, so an exact 20/10 split is
 # only valid while the loop stays inside that interval.
