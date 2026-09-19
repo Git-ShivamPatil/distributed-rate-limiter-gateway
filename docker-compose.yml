@@ -14,6 +14,7 @@ services:
     command: ["--node=gateway-1", "--config=/etc/gateway/docker.yaml"]
     ports:
       - "8080:8080"
+      - "9090:9090"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
       interval: 5s
@@ -25,6 +26,19 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      echo:
+        condition: service_started
+
+  # The upstream the gateway proxies to, so the data path is exercisable with
+  # nothing else installed. It answers with what it received, which is what
+  # lets a test prove the gateway told it who the tenant is and did NOT pass
+  # the caller's credentials along.
+  echo:
+    build: .
+    entrypoint: ["/usr/local/bin/echo"]
+    command: ["--addr=0.0.0.0:9000", "--quiet"]
+    expose:
+      - "9000"
 
   redis:
     image: redis:7-alpine

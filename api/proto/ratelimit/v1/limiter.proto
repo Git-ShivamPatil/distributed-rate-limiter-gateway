@@ -1,0 +1,130 @@
+// The gateway's decision API.
+//
+// It is the same decision the REST endpoint makes -- both call one service
+// inside the process, so the two surfaces cannot drift into answering
+// differently. What differs is the shape: gRPC is what a sidecar or an ingress
+// filter speaks, and streaming decisions is something REST does badly.
+//
+// Each RPC has its own request and response type, even where two would carry
+// identical fields today. Sharing them saves a few lines now and costs a
+// breaking change the first time one method needs a field the other must not
+// have. The payload itself is shared instead, as Quota.
+syntax = "proto3";
+
+package ratelimit.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/api/gen/ratelimit/v1;ratelimitv1";
+
+service LimiterService {
+  // Check asks whether a request fits inside a tenant's quota, and consumes
+  // that quota when it does.
+  //
+  // Errors are status codes rather than fields, because a caller that forgets
+  // to read a field gets a limit it did not enforce:
+  //   NOT_FOUND          no such tenant
+  //   PERMISSION_DENIED  the tenant is disabled
+  //   INVALID_ARGUMENT   no tenant named, or a cost no quota could ever admit
+  //   UNAUTHENTICATED    credentials required, missing or wrong
+  //   UNAVAILABLE        the counter store could not decide and the policy
+  //                      fails closed
+  rpc Check(CheckRequest) returns (CheckResponse);
+
+  // GetQuota reports what Check would answer, consuming nothing.
+  rpc GetQuota(GetQuotaRequest) returns (GetQuotaResponse);
+
+  // StreamDecisions publishes decisions as they are made, for a dashboard or
+  // for watching a tenant in production. It is lossy on purpose: a subscriber
+  // that cannot keep up is skipped rather than allowed to slow the request
+  // path down, and the skip is counted.
+  rpc StreamDecisions(StreamDecisionsRequest) returns (stream StreamDecisionsResponse);
+}
+
+message CheckRequest {
+  // The tenant this decision is about. Credentials in request metadata
+  // (an api key, or a bearer token) override it; the field is for callers the
+  // gateway already trusts.
+  string tenant_id = 1;
+
+  // How many units this request consumes. Zero means one.
+  int64 cost = 2;
+
+  // The request being asked about, so that per-endpoint rules can apply. Left
+  // empty, only the tenant-wide limits are evaluated -- an endpoint rule
+  // cannot be judged against a request nobody described.
+  string method = 3;
+  string path = 4;
+}
+
+message CheckResponse {
+  Quota quota = 1;
+}
+
+message GetQuotaRequest {
+  string tenant_id = 1;
+  string method = 2;
+  string path = 3;
+}
+
+message GetQuotaResponse {
+  Quota quota = 1;
+}
+
+message StreamDecisionsRequest {
+  // Only these tenants. Empty means every tenant this node decides for.
+  repeated string tenant_ids = 1;
+  // Only refusals. A dashboard usually wants these; an audit wants everything.
+  bool denied_only = 2;
+}
+
+message StreamDecisionsResponse {
+  Decision decision = 1;
+}
+
+// LimitState is one rule's contribution to a decision.
+message LimitState {
+  string name = 1;
+  int64 limit = 2;
+  int64 remaining = 3;
+  google.protobuf.Duration retry_after = 4;
+  google.protobuf.Duration reset_after = 5;
+  bool allowed = 6;
+}
+
+// Quota is the answer: whether the request is admitted, and the state of every
+// limit that was consulted.
+message Quota {
+  bool allowed = 1;
+  string tenant_id = 2;
+  string policy = 3;
+  // Which node answered. Every response carries it so a reader can tell which
+  // replica they reached.
+  string node = 4;
+  // Every limit that was evaluated, not just the one that refused.
+  repeated LimitState limits = 5;
+  // The limit that refused, empty when allowed. When several refuse it is the
+  // one with the longest wait, because that is the one to actually wait for.
+  string limiting = 6;
+  google.protobuf.Duration retry_after = 7;
+  // Set when the answer was not authoritative -- the counter store could not
+  // decide and the policy said what to do about it.
+  Degraded degraded = 8;
+}
+
+message Degraded {
+  string reason = 1;
+  // "closed" (refused without enforcing) or "open" (admitted without enforcing)
+  string mode = 2;
+}
+
+message Decision {
+  string tenant_id = 1;
+  string policy = 2;
+  bool allowed = 3;
+  string limiting = 4;
+  string node = 5;
+  int64 cost = 6;
+  google.protobuf.Timestamp at = 7;
+}

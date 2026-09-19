@@ -24,11 +24,14 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
 PORT="${PORT:-18080}"
+GRPC_PORT="${GRPC_PORT:-19090}"
 ADDR="127.0.0.1:${PORT}"
 URL="http://${ADDR}"
 BIN="./bin/gateway"
+ECHO_BIN="./bin/echo"
 LOG="$(mktemp -t gateway-smoke-XXXXXX.log)"
 GATEWAY_PID=""
+ECHO_PID=""
 fail=0
 
 stop_gateway() {
@@ -41,6 +44,10 @@ stop_gateway() {
 
 cleanup() {
   stop_gateway
+  if [ -n "${ECHO_PID}" ] && kill -0 "${ECHO_PID}" 2>/dev/null; then
+    kill "${ECHO_PID}" 2>/dev/null
+    wait "${ECHO_PID}" 2>/dev/null
+  fi
   if [ "${KEEP_LOG:-0}" = "1" ]; then echo "gateway log: ${LOG}"; else rm -f "${LOG}"; fi
 }
 trap cleanup EXIT
@@ -48,7 +55,7 @@ trap cleanup EXIT
 start_gateway() { # $1 = config path, $2 = node id
   local config="$1" node="$2"
   # --flag=value on purpose: this is the form compose and Kubernetes write.
-  "${BIN}" --node="${node}" --config="${config}" --http-addr="${ADDR}" >>"${LOG}" 2>&1 &
+  "${BIN}" --node="${node}" --config="${config}" --http-addr="${ADDR}"     --grpc-addr="127.0.0.1:${GRPC_PORT}" >>"${LOG}" 2>&1 &
   GATEWAY_PID=$!
   for _ in $(seq 1 50); do
     if curl -fsS --max-time 1 "${URL}/healthz" >/dev/null 2>&1; then
@@ -118,6 +125,70 @@ scripts/burst-check.sh --url "${URL}" --tenant acme \
 scripts/burst-check.sh --url "${URL}" --tenant globex \
   --requests 40 --min-allowed 25 --min-denied 1 || fail=1
 
+echo "--- the data path: limited first, forwarded only if admitted ---"
+# The shipped config routes /api/echo at cmd/echo. Start it, reset the tenant,
+# and check both halves: an admitted request reaches the upstream carrying the
+# tenant, and a refused one never gets there.
+go build -o "${ECHO_BIN}" ./cmd/echo || exit 1
+"${ECHO_BIN}" --addr=127.0.0.1:9000 --quiet >>"${LOG}" 2>&1 &
+ECHO_PID=$!
+for _ in $(seq 1 50); do
+  if curl -fsS --max-time 1 http://127.0.0.1:9000/healthz >/dev/null 2>&1; then break; fi
+  sleep 0.2
+done
+
+go run ./cmd/gatewayctl counters reset --config ./configs/local.yaml --tenant proxy-demo >/dev/null || exit 1
+
+proxied=$(curl -s --max-time 5 -H 'X-Tenant-ID: acme' -H 'Authorization: Bearer not-for-the-upstream' \
+  "${URL}/api/echo/hello")
+if ! echo "${proxied}" | grep -q '"path":"/echo/hello"'; then
+  echo "FAIL: the proxied request did not reach the upstream with the prefix stripped: ${proxied}" >&2
+  fail=1
+fi
+if ! echo "${proxied}" | grep -q '"tenant":"acme"'; then
+  echo "FAIL: the upstream was not told which tenant this is: ${proxied}" >&2
+  fail=1
+fi
+if ! echo "${proxied}" | grep -q '"saw_authorization":false'; then
+  echo "FAIL: the caller's credentials were forwarded to the upstream: ${proxied}" >&2
+  echo "  An upstream trusts the gateway, not the client." >&2
+  fail=1
+fi
+
+# acme is exhausted by now, so proxied requests for it must be refused at the
+# gateway rather than forwarded.
+denied=0
+for _ in $(seq 1 30); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'X-Tenant-ID: acme' "${URL}/api/echo")
+  if [ "${code}" = "429" ]; then denied=$((denied + 1)); fi
+done
+if [ "${denied}" -eq 0 ]; then
+  echo "FAIL: 30 proxied requests on an exhausted tenant produced no refusals" >&2
+  fail=1
+fi
+
+echo "--- gRPC answers the same question ---"
+if command -v grpcurl >/dev/null 2>&1; then
+  grpc_out=$(grpcurl -plaintext -d '{"tenant_id":"globex"}' \
+    "127.0.0.1:${GRPC_PORT}" ratelimit.v1.LimiterService/Check 2>&1)
+  if ! echo "${grpc_out}" | grep -q '"allowed": true'; then
+    echo "FAIL: the gRPC Check did not return an allowed decision: ${grpc_out}" >&2
+    fail=1
+  fi
+  if ! echo "${grpc_out}" | grep -q '"node"'; then
+    echo "FAIL: the gRPC decision does not say which node answered: ${grpc_out}" >&2
+    fail=1
+  fi
+  # Reflection has to work, because the published command has no -proto flag.
+  if ! grpcurl -plaintext "127.0.0.1:${GRPC_PORT}" list 2>&1 | grep -q 'ratelimit.v1.LimiterService'; then
+    echo "FAIL: server reflection is not registered, so the published grpcurl command needs the .proto files" >&2
+    fail=1
+  fi
+else
+  echo "SKIPPED: grpcurl is not installed; CI runs this. Install with"
+  echo "  go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest"
+fi
+
 echo "--- an unknown tenant is refused, not given a free pass ---"
 # With policies in the database and no catch-all, a tenant nobody created has
 # no limits -- and a limiter that treats "no limits" as "unlimited" turns a
@@ -137,6 +208,8 @@ echo
 echo "=== phase 2: fixed limits, no refill during the run ==="
 start_gateway ./scripts/testdata/smoke.yaml smoke-fixed || exit 1
 
+# The fixed-limit config has no routes and no gRPC of its own; the data path
+# was covered in phase 1.
 echo "--- an allowed response carries the headers and no Retry-After ---"
 allowed_headers=$(curl -s -D - -o /dev/null --max-time 5 -H 'X-Tenant-ID: header-check' "${URL}/v1/check")
 if [ "$(header_value X-RateLimit-Limit "${allowed_headers}")" != "20" ]; then

@@ -1,4 +1,4 @@
-.PHONY: help build run test race vet fmt lint smoke verify up down logs migrate clean
+.PHONY: help build run echo test race vet fmt lint smoke verify up down logs migrate clean proto proto-lint proto-check
 
 GO      ?= go
 BIN     ?= ./bin/gateway
@@ -14,6 +14,19 @@ build: ## Compile the gateway
 run: ## Run a gateway node against configs/local.yaml
 	$(GO) run ./cmd/gateway --node=$(NODE) --config=$(CONFIG)
 
+echo: ## Run the echo upstream the default route points at
+	$(GO) run ./cmd/echo --addr=127.0.0.1:9000
+
+proto: ## Regenerate the gRPC code from api/proto
+	buf generate
+
+proto-lint: ## Lint the protobuf definitions
+	buf lint
+
+proto-check: proto-lint ## Fail if the committed generated code is not current
+	buf generate
+	git diff --exit-code -- api/gen
+
 test: ## Unit tests with the race detector
 	$(GO) test ./... -race -count=1
 
@@ -26,7 +39,7 @@ fmt: ## Format, and fail if anything was unformatted
 smoke: ## Start a real gateway and exercise it over a socket
 	./scripts/gateway-smoke.sh
 
-verify: fmt vet test smoke ## Everything CI runs
+verify: fmt vet test smoke ## Everything CI runs (add proto-check with buf installed)
 
 up: ## Start the data plane (redis, postgres)
 	docker compose up -d redis postgres

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/config"
+	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/decide"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/policy"
 )
@@ -38,7 +39,8 @@ func newTestServer(t *testing.T, clock limiter.Clock) (*Server, *limiter.Memory)
 		t.Fatal(err)
 	}
 	mem := limiter.NewMemory(limiter.WithClock(clock))
-	return New(cfg, mem, policies, nil), mem
+	decider := decide.New(mem, policies, cfg.Node.ID)
+	return New(cfg, decider, nil), mem
 }
 
 func get(t *testing.T, h http.Handler, path string, headers map[string]string) *httptest.ResponseRecorder {
@@ -208,7 +210,8 @@ func TestCheckUnknownTenantWithoutDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := New(cfg, limiter.NewMemory(limiter.WithClock(limiter.NewFakeClock(time.Unix(1_700_000_000, 0)))), policies, nil)
+	mem := limiter.NewMemory(limiter.WithClock(limiter.NewFakeClock(time.Unix(1_700_000_000, 0))))
+	srv := New(cfg, decide.New(mem, policies, cfg.Node.ID), nil)
 
 	rec := get(t, srv.Handler(), "/v1/check", map[string]string{TenantHeader: "who-is-this"})
 	if rec.Code != http.StatusNotFound {
@@ -225,7 +228,7 @@ func TestCheckTenantHeaderCanBeDistrusted(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.CheckAPI.TrustTenantHeader = false
 	policies, _ := policy.NewStatic(cfg.Policies)
-	srv := New(cfg, limiter.NewMemory(), policies, nil)
+	srv := New(cfg, decide.New(limiter.NewMemory(), policies, cfg.Node.ID), nil)
 
 	rec := get(t, srv.Handler(), "/v1/check", map[string]string{TenantHeader: "acme"})
 	if rec.Code != http.StatusBadRequest {
@@ -248,7 +251,7 @@ func TestCheckStoreFailure(t *testing.T) {
 	t.Run("closed refuses", func(t *testing.T) {
 		cfg := testConfig(t)
 		policies, _ := policy.NewStatic(cfg.Policies)
-		srv := New(cfg, failingChecker{storeDown}, policies, nil)
+		srv := New(cfg, decide.New(failingChecker{storeDown}, policies, cfg.Node.ID), nil)
 
 		rec := get(t, srv.Handler(), "/v1/check", map[string]string{TenantHeader: "acme"})
 		if rec.Code != http.StatusServiceUnavailable {
@@ -267,7 +270,7 @@ func TestCheckStoreFailure(t *testing.T) {
 		free.FailureMode = config.FailOpen
 		cfg.Policies.Named["free"] = free
 		policies, _ := policy.NewStatic(cfg.Policies)
-		srv := New(cfg, failingChecker{storeDown}, policies, nil)
+		srv := New(cfg, decide.New(failingChecker{storeDown}, policies, cfg.Node.ID), nil)
 
 		rec := get(t, srv.Handler(), "/v1/check", map[string]string{TenantHeader: "acme"})
 		if rec.Code != http.StatusOK {

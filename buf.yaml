@@ -1,0 +1,11 @@
+version: v2
+modules:
+  - path: api/proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  # Once this API is published, a change that breaks a caller has to be a new
+  # version rather than an edit. FILE is the strictest useful setting.
+  use:
+    - FILE

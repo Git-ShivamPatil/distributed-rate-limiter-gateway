@@ -1,0 +1,12 @@
+version: v2
+
+# Local plugins rather than remote ones: generation then needs nothing but the
+# two binaries `go install` puts in GOBIN, so CI can check the committed code
+# is current without depending on a registry being reachable.
+plugins:
+  - local: protoc-gen-go
+    out: api/gen
+    opt: paths=source_relative
+  - local: protoc-gen-go-grpc
+    out: api/gen
+    opt: paths=source_relative

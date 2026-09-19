@@ -15,6 +15,10 @@
 node:
   id: gateway-1
   http_addr: ":8080"
+  # The Limiter service: Check, GetQuota and a decision stream. Reflection is
+  # registered, so `grpcurl -plaintext localhost:9090 list` works without the
+  # .proto files.
+  grpc_addr: ":9090"
   read_timeout: 5s
   write_timeout: 10s
   shutdown_grace: 10s
@@ -87,3 +91,16 @@ check_api:
   # off the internet, where anything that can reach the endpoint could name any
   # tenant and spend its quota. Credentials, when present, always win.
   trust_tenant_header: true
+
+routes:
+  # The data path. A request matching a route is limited first and forwarded
+  # only if it is admitted, so a tenant over its quota costs the upstream
+  # nothing. The longest matching prefix wins, so this list's order never
+  # decides anything.
+  #
+  # `go run ./cmd/echo` serves the upstream these point at.
+  - name: echo
+    path_prefix: /api/echo
+    upstream: "http://127.0.0.1:9000"
+    # /api/echo/hello reaches the upstream as /echo/hello.
+    strip_prefix: /api

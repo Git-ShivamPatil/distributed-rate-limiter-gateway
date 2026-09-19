@@ -9,6 +9,7 @@
 node:
   id: gateway-1
   http_addr: "0.0.0.0:8080"
+  grpc_addr: "0.0.0.0:9090"
   read_timeout: 5s
   write_timeout: 10s
   shutdown_grace: 10s
@@ -24,6 +25,25 @@ redis:
 
 postgres:
   dsn: "postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable"
+
+policy:
+  store: postgres
+  cache_ttl: 5s
+  negative_cache_ttl: 1s
+  stale_for: 5m
+  listen_for_changes: true
+
+auth:
+  api_keys: true
+  jwt_secret_env: GATEWAY_JWT_SECRET
+  jwt_tenant_claim: tid
+  admin_token_env: GATEWAY_ADMIN_TOKEN
+
+routes:
+  - name: echo
+    path_prefix: /api/echo
+    upstream: "http://echo:9000"
+    strip_prefix: /api
 
 policies:
   default: free

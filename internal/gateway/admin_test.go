@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/auth"
+	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/decide"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/policy"
 )
@@ -116,7 +117,7 @@ func adminServer(t *testing.T, store AdminStore, token string) (*Server, *policy
 	if store != nil {
 		opts = append(opts, WithAdmin(store, auth.NewAdminToken(token)))
 	}
-	srv := New(cfg, limiter.NewMemory(), cache, nil, opts...)
+	srv := New(cfg, decide.New(limiter.NewMemory(), cache, cfg.Node.ID), nil, opts...)
 	return srv, cache
 }
 

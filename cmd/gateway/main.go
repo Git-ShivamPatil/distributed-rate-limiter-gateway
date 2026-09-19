@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,10 +23,15 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	goredis "github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/auth"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/config"
+	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/decide"
+	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/events"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/gateway"
+	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/grpcapi"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter"
 	redislimiter "github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter/redis"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/policy"
@@ -42,6 +48,7 @@ type options struct {
 	configPath string
 	node       string
 	httpAddr   string
+	grpcAddr   string
 	logLevel   string
 	logFormat  string
 }
@@ -52,6 +59,7 @@ func parseFlags(args []string) (options, error) {
 	fs.StringVar(&o.configPath, "config", "", "path to the YAML configuration file")
 	fs.StringVar(&o.node, "node", "", "node id; overrides node.id from the config")
 	fs.StringVar(&o.httpAddr, "http-addr", "", "HTTP listen address; overrides node.http_addr")
+	fs.StringVar(&o.grpcAddr, "grpc-addr", "", "gRPC listen address; overrides node.grpc_addr")
 	fs.StringVar(&o.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.StringVar(&o.logFormat, "log-format", "text", "text or json")
 	fs.Usage = func() {
@@ -92,6 +100,9 @@ func run(args []string) error {
 	}
 	if opts.httpAddr != "" {
 		cfg.Node.HTTPAddr = opts.httpAddr
+	}
+	if opts.grpcAddr != "" {
+		cfg.Node.GRPCAddr = opts.grpcAddr
 	}
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -156,6 +167,11 @@ func run(args []string) error {
 		return policyReady(ctx)
 	}
 
+	// One decision service behind both surfaces. REST and gRPC translate; they
+	// do not decide.
+	hub := events.NewHub(events.DefaultBuffer)
+	decider := decide.New(checker, policies, cfg.Node.ID, decide.WithHub(hub))
+
 	serverOpts := []gateway.Option{
 		gateway.WithReadiness(ready),
 		gateway.WithAuth(authn),
@@ -166,7 +182,21 @@ func run(args []string) error {
 	if adminStore != nil {
 		serverOpts = append(serverOpts, gateway.WithAdmin(adminStore, adminToken))
 	}
-	srv := gateway.New(cfg, checker, policies, log, serverOpts...)
+	if len(cfg.Routes) > 0 {
+		proxy, err := gateway.NewProxy(cfg.Routes, log)
+		if err != nil {
+			return err
+		}
+		serverOpts = append(serverOpts, gateway.WithProxy(proxy))
+		log.Info("proxy routes configured", "routes", proxy.Routes())
+	}
+	srv := gateway.New(cfg, decider, log, serverOpts...)
+
+	stopGRPC, err := serveGRPC(cfg, decider, hub, adminStore, log)
+	if err != nil {
+		return err
+	}
+	defer stopGRPC()
 
 	httpSrv := &http.Server{
 		Addr:         cfg.Node.HTTPAddr,
@@ -206,6 +236,59 @@ func run(args []string) error {
 	}
 	log.Info("stopped", "node", cfg.Node.ID)
 	return nil
+}
+
+// serveGRPC starts the Limiter service and returns a function that stops it.
+//
+// Reflection is registered because the published command is a bare
+// `grpcurl -plaintext ... Check`: without it a caller has to supply the .proto
+// files, and a documented command that only works with extra arguments is a
+// documented command that does not work.
+func serveGRPC(cfg config.Config, decider *decide.Service, hub *events.Hub, store gateway.AdminStore, log *slog.Logger) (func(), error) {
+	if cfg.Node.GRPCAddr == "" {
+		log.Info("gRPC is disabled (node.grpc_addr is empty)")
+		return func() {}, nil
+	}
+
+	lis, err := net.Listen("tcp", cfg.Node.GRPCAddr)
+	if err != nil {
+		return nil, fmt.Errorf("gRPC listen on %s: %w", cfg.Node.GRPCAddr, err)
+	}
+
+	opts := []grpcapi.Option{
+		grpcapi.WithHub(hub),
+		grpcapi.WithTrustedTenantField(cfg.CheckAPI.TrustTenantHeader),
+	}
+	if resolver, ok := store.(auth.KeyResolver); ok && store != nil && cfg.Auth.APIKeys {
+		opts = append(opts, grpcapi.WithKeyResolver(resolver))
+	}
+
+	server := grpc.NewServer()
+	grpcapi.New(decider, log, opts...).Register(server)
+	reflection.Register(server)
+
+	go func() {
+		log.Info("gRPC listening", "addr", cfg.Node.GRPCAddr, "service", "ratelimit.v1.LimiterService")
+		if err := server.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			log.Error("gRPC server stopped", "err", err)
+		}
+	}()
+
+	return func() {
+		// GracefulStop waits for in-flight RPCs, including a streaming
+		// subscriber that has not noticed the shutdown yet, so the caller's
+		// context cancellation is what ends the stream.
+		stopped := make(chan struct{})
+		go func() {
+			server.GracefulStop()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-time.After(cfg.Node.ShutdownGrace):
+			server.Stop()
+		}
+	}, nil
 }
 
 // buildPolicySource assembles where policies come from.

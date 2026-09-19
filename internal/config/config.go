@@ -29,6 +29,20 @@ type Config struct {
 	Policy   PolicyStore `yaml:"policy"`
 	Auth     Auth        `yaml:"auth"`
 	CheckAPI CheckAPI    `yaml:"check_api"`
+	Routes   []Route     `yaml:"routes"`
+}
+
+// Route sends matching requests to an upstream, after the limiter has decided.
+type Route struct {
+	Name string `yaml:"name"`
+	// PathPrefix is matched against the request path; the longest matching
+	// route wins, so the order of this list never decides anything.
+	PathPrefix string `yaml:"path_prefix"`
+	// Upstream is an absolute URL: scheme, host, and optionally a base path.
+	Upstream string `yaml:"upstream"`
+	// StripPrefix is removed from the path before forwarding, so that a
+	// gateway-side /api/echo can reach an upstream that serves /echo.
+	StripPrefix string `yaml:"strip_prefix"`
 }
 
 // PolicyStore selects where policies come from and how long they are cached.
@@ -80,6 +94,8 @@ type Node struct {
 	// this node owns.
 	ID       string `yaml:"id"`
 	HTTPAddr string `yaml:"http_addr"`
+	// GRPCAddr serves the Limiter service. Empty disables gRPC.
+	GRPCAddr string `yaml:"grpc_addr"`
 	// ShutdownGrace bounds how long in-flight requests have to finish when the
 	// process is asked to stop.
 	ShutdownGrace time.Duration `yaml:"shutdown_grace"`
@@ -160,6 +176,7 @@ func Defaults() Config {
 		Node: Node{
 			ID:            "gateway-1",
 			HTTPAddr:      ":8080",
+			GRPCAddr:      ":9090",
 			ShutdownGrace: 10 * time.Second,
 			ReadTimeout:   5 * time.Second,
 			WriteTimeout:  10 * time.Second,
@@ -254,6 +271,10 @@ func (c Config) Validate() error {
 	// A secret in the config file would be a secret in the repository.
 	if strings.Contains(c.Auth.JWTSecretEnv, " ") || strings.HasPrefix(c.Auth.JWTSecretEnv, "-") {
 		return fmt.Errorf("config: auth.jwt_secret_env must name an environment variable, not hold a secret")
+	}
+
+	if err := validateRoutes(c.Routes); err != nil {
+		return fmt.Errorf("config: %w", err)
 	}
 
 	seen := map[string]bool{}
