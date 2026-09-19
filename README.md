@@ -5,7 +5,7 @@
 **Multi-tenant gateway · token-bucket and sliding-window quotas · consistent-hash shard ring · Raft election over shard failure**
 
 ![status](https://img.shields.io/badge/status-in_development-111111?style=flat-square)
-![progress](https://img.shields.io/badge/milestones-3_of_9-4a4a4a?style=flat-square)
+![progress](https://img.shields.io/badge/milestones-0_of_9-4a4a4a?style=flat-square)
 ![licence](https://img.shields.io/badge/licence-MIT-767676?style=flat-square)
 
 ![Go](https://img.shields.io/badge/Go-1.23+-000000?style=flat-square&logo=go&logoColor=white)
@@ -19,7 +19,7 @@
 ---
 
 > [!IMPORTANT]
-> **3 of 9 milestones complete — M1–M3 run today.** `45K req/s · <8ms p99` is a target, not a measurement; nothing is benchmarked yet. Every number lands in [CLAIMS.md](CLAIMS.md) first, with its commit, host and caveat.
+> **0 of 9 milestones complete.** There is working code below, but no milestone has passed its verification step yet — see [what runs today](#run-what-exists-today) for exactly what does and does not exist. `45K req/s · <8ms p99` is a target, not a measurement; nothing is benchmarked yet. Every number lands in [CLAIMS.md](CLAIMS.md) first, with its commit, host and caveat.
 
 ## Problem
 
@@ -27,7 +27,16 @@ Keep per-tenant quotas accurate across replicas while a noisy neighbour, a lost 
 
 ## Run what exists today
 
-The only project in the series with working code. Tests need no containers — the Redis-backed limiter is covered by an in-process fake:
+Working code, but not yet a milestone. What exists: an in-memory token bucket, an in-memory
+sliding-window log, a Redis-backed token bucket driven by one atomic Lua script, and HTTP
+middleware that returns 429 with `Retry-After`.
+
+What the milestones below still ask for and this does **not** have: the `--node` / `--config`
+flags and `configs/local.yaml` the case study advertises, a `/v1/check` endpoint, a Redis
+sliding window, Redis `TIME` as the clock source (today's script is handed the *gateway's*
+clock, which drifts between replicas), a policy store, and CI.
+
+Tests need no containers — the Redis-backed limiter is covered by an in-process fake:
 
 ```bash
 go test ./...                                                   # tests
@@ -87,11 +96,11 @@ Raft governs **membership and ring ownership only**, never per-request counters 
 
 ## Roadmap
 
-`[████████░░░░░░░░░░░░░░░░] 3/9` — ticked only when the verification step passes, not when the code is written.
+`[░░░░░░░░░░░░░░░░░░░░░░░░] 0/9` — ticked only when the verification step passes, not when the code is written.
 
-- [x] **M1 · Skeleton, config, single-node token bucket that says 429** — one process enforces an in-memory per-tenant bucket over REST, on the advertised config path and flags.
-- [x] **M2 · Redis-backed token bucket and sliding window** — both strategies as single-round-trip atomic Lua; two processes sharing one Redis enforce one quota.
-- [x] **M3 · Postgres policy store, tenant auth, hot-reloading cache** — per-tenant and per-endpoint policies in Postgres, served from an in-process cache; `make migrate` works as advertised.
+- [ ] **M1 · Skeleton, config, single-node token bucket that says 429** — one process enforces an in-memory per-tenant bucket over REST, on the advertised config path and flags.
+- [ ] **M2 · Redis-backed token bucket and sliding window** — both strategies as single-round-trip atomic Lua; two processes sharing one Redis enforce one quota.
+- [ ] **M3 · Postgres policy store, tenant auth, hot-reloading cache** — per-tenant and per-endpoint policies in Postgres, served from an in-process cache; `make migrate` works as advertised.
 - [ ] **M4 · gRPC contract and the actual gateway data path** — authenticates, routes, applies policy and proxies upstream; same decisions over gRPC.
 - [ ] **M5 · Consistent-hash ring with cross-node forwarding** — a tenant always lands on the same shard; a node that does not own it forwards over gRPC.
 - [ ] **M6 · Raft membership and leader election** — ring ownership survives a node dying; enforcement continues with quota accuracy across the rebalance.
