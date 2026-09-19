@@ -1,0 +1,8 @@
+# The shell scripts here run on Linux, in containers and on CI runners. A CRLF
+# checkout on Windows turns `#!/usr/bin/env bash` into a file whose interpreter
+# has a carriage return in its name, and the error says "no such file or
+# directory" about a path that plainly exists.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.svg text eol=lf

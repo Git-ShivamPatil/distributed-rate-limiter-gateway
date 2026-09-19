@@ -1,0 +1,57 @@
+# The configuration the container runs. It differs from local.yaml in exactly
+# two ways -- the listen address is on all interfaces rather than loopback, and
+# the dependencies are named by their compose service rather than localhost.
+#
+# Binding 0.0.0.0 matters: a process inside a container that binds 127.0.0.1
+# is unreachable through its published port, and the failure looks like a
+# network problem rather than a one-word config difference.
+
+node:
+  id: gateway-1
+  http_addr: "0.0.0.0:8080"
+  read_timeout: 5s
+  write_timeout: 10s
+  shutdown_grace: 10s
+
+limiter:
+  backend: memory
+  sweep_interval: 30s
+
+redis:
+  addr: "redis:6379"
+  pool_size: 64
+  timeout: 250ms
+
+postgres:
+  dsn: "postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable"
+
+policies:
+  default: free
+  named:
+    free:
+      failure_mode: closed
+      limits:
+        - name: per-minute
+          algorithm: token_bucket
+          count: 20
+          period: 1m
+          burst: 20
+    pro:
+      failure_mode: closed
+      limits:
+        - name: per-minute
+          algorithm: token_bucket
+          count: 1000
+          period: 1m
+          burst: 200
+        - name: per-second
+          algorithm: sliding_window
+          count: 25
+          period: 1s
+
+  tenants:
+    acme: free
+    globex: pro
+
+check_api:
+  trust_tenant_header: true

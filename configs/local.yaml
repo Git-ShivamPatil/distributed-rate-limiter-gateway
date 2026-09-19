@@ -1,0 +1,78 @@
+# The configuration the case study runs:
+#
+#   go run ./cmd/gateway --node gateway-1 --config ./configs/local.yaml
+#
+# Every value here has a default in internal/config; this file exists to be
+# read, so it sets them explicitly. An unknown key is a startup error rather
+# than a silently ignored typo.
+
+node:
+  id: gateway-1
+  http_addr: ":8080"
+  read_timeout: 5s
+  write_timeout: 10s
+  shutdown_grace: 10s
+
+limiter:
+  # memory: counters live in this process, so two replicas each enforce the
+  # whole limit -- fine for one node, wrong for a cluster. Milestone 2 moves
+  # this to redis, which is what makes the quota shared.
+  backend: memory
+  sweep_interval: 30s
+
+redis:
+  addr: "localhost:6379"
+  pool_size: 64
+  timeout: 250ms
+
+postgres:
+  # Used from milestone 3. `docker compose up -d redis postgres` starts it.
+  dsn: "postgres://gateway:gateway@localhost:5432/gateway?sslmode=disable"
+
+policies:
+  # A tenant with no policy of its own gets this one. Remove the line and an
+  # unknown tenant is refused instead -- which is the right setting once real
+  # tenants exist in the policy store.
+  default: free
+
+  named:
+    free:
+      # Refuse when the counter store cannot be reached. The alternative,
+      # `open`, keeps traffic flowing during a Redis outage and stops enforcing
+      # the limit while it lasts.
+      failure_mode: closed
+      limits:
+        # 20 requests, refilling over a minute, burst 20. A cold tenant can
+        # spend all 20 at once and then waits 3 seconds per request.
+        - name: per-minute
+          algorithm: token_bucket
+          count: 20
+          period: 1m
+          burst: 20
+
+    pro:
+      failure_mode: closed
+      limits:
+        # A generous tenant-wide budget with room for a burst...
+        - name: per-minute
+          algorithm: token_bucket
+          count: 1000
+          period: 1m
+          burst: 200
+        # ...and an exact short-window cap that a burst cannot walk around.
+        # Both have to admit a request, and a request refused by either
+        # consumes from neither.
+        - name: per-second
+          algorithm: sliding_window
+          count: 25
+          period: 1s
+
+  tenants:
+    acme: free
+    globex: pro
+
+check_api:
+  # The decision endpoint takes the tenant from X-Tenant-ID. That is right for
+  # a limiter called by trusted infrastructure and wrong for traffic off the
+  # internet; milestone 3 adds authenticated tenant identity for the proxy path.
+  trust_tenant_header: true

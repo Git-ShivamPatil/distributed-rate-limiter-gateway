@@ -1,0 +1,53 @@
+# A configuration for the smoke test, and for nothing else.
+#
+# It exists so that assertions about headers and refusal semantics do not
+# depend on how fast the test machine is. Every limit here refills over an
+# hour, so nothing replenishes mid-run and an exact count stays exact whether
+# the loop takes 300ms or 30 seconds.
+#
+# The shipped configs/local.yaml is exercised separately, by the scenario that
+# reproduces the case study's own numbers. Keeping the two apart is deliberate:
+# a test that reads its numbers from the demo config silently re-rates itself
+# whenever the demo is tuned.
+
+node:
+  id: smoke-fixed
+  # The smoke script passes --http-addr, which overrides this.
+  http_addr: "127.0.0.1:18081"
+
+limiter:
+  backend: memory
+  sweep_interval: 30s
+
+policies:
+  default: fixed
+  named:
+    fixed:
+      failure_mode: closed
+      limits:
+        - name: per-hour
+          algorithm: token_bucket
+          count: 20
+          period: 1h
+          burst: 20
+
+    # Two limits, so the response has to report both and the tighter one has to
+    # be the one the headers describe.
+    dual:
+      failure_mode: closed
+      limits:
+        - name: per-hour
+          algorithm: token_bucket
+          count: 1000
+          period: 1h
+          burst: 1000
+        - name: strict
+          algorithm: sliding_window
+          count: 5
+          period: 1h
+
+  tenants:
+    dual-tenant: dual
+
+check_api:
+  trust_tenant_header: true

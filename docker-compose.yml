@@ -1,19 +1,37 @@
+# The data plane the case study starts first:
+#
+#   docker compose up -d redis postgres
+#
+# and the whole stack, gateway included:
+#
+#   docker compose up --build
+#
 services:
   gateway:
     build: .
+    # --flag=value, which is what every declarative runner writes. The binary
+    # accepts both forms and scripts/cli-args-test.sh keeps it that way.
+    command: ["--node=gateway-1", "--config=/etc/gateway/docker.yaml"]
     ports:
       - "8080:8080"
-    environment:
-      RATE_LIMIT_BACKEND: redis
-      REDIS_ADDR: redis:6379
-      RATE_LIMIT_CAPACITY: "20"
-      RATE_LIMIT_REFILL_PER_SEC: "5"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   redis:
     image: redis:7-alpine
+    # No persistence: these are rate-limit counters. Every key has a TTL equal
+    # to the moment its state stops meaning anything, so a restart costs at
+    # most one window of enforcement and never over-admits beyond it.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "6379:6379"
     healthcheck:
@@ -22,12 +40,16 @@ services:
       timeout: 3s
       retries: 5
 
-  # Staged for an upcoming milestone -- not wired into the gateway yet.
   postgres:
     image: postgres:16-alpine
-    ports:
-      - "5432:5432"
     environment:
       POSTGRES_USER: gateway
       POSTGRES_PASSWORD: gateway
       POSTGRES_DB: gateway
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
