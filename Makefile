@@ -37,9 +37,14 @@ down: ## Stop the data plane
 logs: ## Follow the data plane logs
 	docker compose logs -f
 
-migrate: ## Apply the policy-store schema (milestone 3)
-	@echo "migrate: the policy store lands in milestone 3; nothing to apply yet" >&2
-	@exit 1
+migrate: ## Apply the policy-store schema
+	$(GO) run ./cmd/gatewayctl migrate up --config $(CONFIG)
+
+migrate-down: ## Roll back one migration
+	$(GO) run ./cmd/gatewayctl migrate down 1 --config $(CONFIG)
+
+migrate-version: ## Print the applied schema version
+	$(GO) run ./cmd/gatewayctl migrate version --config $(CONFIG)
 
 clean: ## Remove build output
 	rm -rf ./bin

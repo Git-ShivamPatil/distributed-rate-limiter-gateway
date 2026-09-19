@@ -10,6 +10,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/config"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter"
@@ -22,6 +24,53 @@ import (
 // turns into unlimited traffic.
 var ErrTenantNotFound = errors.New("policy: no policy for tenant")
 
+// ErrUnknownKey means the presented API key matches no live key.
+var ErrUnknownKey = errors.New("policy: unknown api key")
+
+// Match narrows a limit to some of a tenant's requests. The zero value applies
+// to all of them, which is how a tenant-wide quota is expressed.
+type Match struct {
+	// Method is an HTTP method, or "*"/"" for any.
+	Method string `json:"method,omitempty"`
+	// PathPrefix matches the start of the request path. Empty matches any.
+	//
+	// A prefix rather than a pattern: matching is on the request path of every
+	// single check, and the cost of a wrong answer here is a limit that
+	// silently does not apply. Prefixes are the shape an operator can predict
+	// without reading the router.
+	PathPrefix string `json:"path_prefix,omitempty"`
+}
+
+// Validate reports why a match cannot be used.
+func (m Match) Validate() error {
+	switch m.Method {
+	case "", "*", http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+		http.MethodPatch, http.MethodDelete, http.MethodOptions:
+	default:
+		return fmt.Errorf("match: %q is not an HTTP method or \"*\"", m.Method)
+	}
+	if m.PathPrefix != "" && !strings.HasPrefix(m.PathPrefix, "/") {
+		return fmt.Errorf("match: path prefix %q does not start with /", m.PathPrefix)
+	}
+	return nil
+}
+
+// Applies reports whether this match covers a request.
+func (m Match) Applies(method, path string) bool {
+	if m.Method != "" && m.Method != "*" && !strings.EqualFold(m.Method, method) {
+		return false
+	}
+	if m.PathPrefix != "" && !strings.HasPrefix(path, m.PathPrefix) {
+		return false
+	}
+	return true
+}
+
+// Universal reports whether this match covers everything.
+func (m Match) Universal() bool {
+	return (m.Method == "" || m.Method == "*") && m.PathPrefix == ""
+}
+
 // Policy is the rule set for one tenant.
 //
 // A Policy returned by a Source is READ-ONLY. Lookup happens on the request
@@ -33,12 +82,59 @@ type Policy struct {
 	Name string
 	// Limits all have to admit a request for it to be admitted.
 	Limits []limiter.Limit
+	// Matches is parallel to Limits: entry i says which requests limit i
+	// applies to. A limit with a universal match is the tenant-wide quota; one
+	// with a method or prefix is an endpoint rule. Empty means all universal.
+	Matches []Match
 	// FailureMode decides what happens when the counter store is unreachable.
 	FailureMode string
 }
 
 // FailsClosed reports whether an unreachable counter store should refuse.
 func (p Policy) FailsClosed() bool { return p.FailureMode != config.FailOpen }
+
+// LimitsFor returns the limits that apply to one request.
+//
+// The decision API can ask without a method or path, in which case only the
+// tenant-wide limits apply -- an endpoint rule cannot be evaluated against a
+// request nobody described, and guessing would either over- or under-enforce.
+func (p Policy) LimitsFor(method, path string) []limiter.Limit {
+	if len(p.Matches) == 0 {
+		return p.Limits
+	}
+	// The common case is that every limit applies; avoid the allocation.
+	all := true
+	for i := range p.Limits {
+		if i < len(p.Matches) && !p.matchApplies(i, method, path) {
+			all = false
+			break
+		}
+	}
+	if all {
+		return p.Limits
+	}
+	out := make([]limiter.Limit, 0, len(p.Limits))
+	for i := range p.Limits {
+		if p.matchApplies(i, method, path) {
+			out = append(out, p.Limits[i])
+		}
+	}
+	return out
+}
+
+func (p Policy) matchApplies(i int, method, path string) bool {
+	if i >= len(p.Matches) {
+		return true
+	}
+	m := p.Matches[i]
+	if m.Universal() {
+		return true
+	}
+	if method == "" && path == "" {
+		return false // an endpoint rule against an undescribed request
+	}
+	return m.Applies(method, path)
+}
 
 // Source resolves a tenant to its policy.
 type Source interface {

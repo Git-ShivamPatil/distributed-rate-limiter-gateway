@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/auth"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/config"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/policy"
@@ -35,10 +36,27 @@ type Server struct {
 	log      *slog.Logger
 	router   chi.Router
 	ready    func(context.Context) error
+
+	authn      *auth.Authenticator
+	admin      AdminStore
+	adminToken *auth.AdminToken
+	cache      *policy.Cache
 }
 
 // Option configures a Server.
 type Option func(*Server)
+
+// WithAuth supplies the authenticator that resolves a tenant from credentials.
+func WithAuth(a *auth.Authenticator) Option { return func(s *Server) { s.authn = a } }
+
+// WithAdmin enables the management API over a writable store, behind a token.
+func WithAdmin(store AdminStore, token *auth.AdminToken) Option {
+	return func(s *Server) { s.admin, s.adminToken = store, token }
+}
+
+// WithCache lets admin writes invalidate this node's policy cache immediately,
+// rather than waiting for the TTL on the node that served the write.
+func WithCache(c *policy.Cache) Option { return func(s *Server) { s.cache = c } }
 
 // WithReadiness supplies the check behind /readyz -- typically a round trip to
 // the counter store. It is deliberately separate from /healthz: liveness asks
@@ -74,6 +92,7 @@ func New(cfg config.Config, checker limiter.Checker, policies policy.Source, log
 		r.Get("/check", s.handleCheck)
 		r.Post("/check", s.handleCheck)
 	})
+	s.mountAdmin(r)
 
 	s.router = r
 	return s
@@ -158,7 +177,15 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 	tenant, err := s.resolveTenant(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "tenant_missing", err.Error())
+		switch {
+		case errors.Is(err, auth.ErrBadCredentials):
+			writeError(w, http.StatusUnauthorized, "bad_credentials", "the credentials presented are not valid")
+		case errors.Is(err, auth.ErrNoCredentials):
+			w.Header().Set("WWW-Authenticate", `Bearer realm="gateway"`)
+			writeError(w, http.StatusUnauthorized, "no_credentials", "an API key or bearer token is required")
+		default:
+			writeError(w, http.StatusBadRequest, "tenant_missing", err.Error())
+		}
 		return
 	}
 
@@ -170,19 +197,32 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 
 	pol, err := s.policies.Lookup(r.Context(), tenant)
 	if err != nil {
-		if errors.Is(err, policy.ErrTenantNotFound) {
+		switch {
+		case errors.Is(err, policy.ErrTenantNotFound):
 			writeError(w, http.StatusNotFound, "tenant_unknown",
 				fmt.Sprintf("no policy for tenant %q", tenant))
-			return
+		case errors.Is(err, policy.ErrTenantDisabled):
+			// Distinct from unknown on purpose: a disabled tenant is a
+			// decision somebody made, and it should not read as a lost record.
+			writeError(w, http.StatusForbidden, "tenant_disabled",
+				fmt.Sprintf("tenant %q is disabled", tenant))
+		default:
+			s.log.Error("policy lookup failed", "tenant", tenant, "err", err)
+			writeError(w, http.StatusServiceUnavailable, "policy_unavailable", "policy store unavailable")
 		}
-		s.log.Error("policy lookup failed", "tenant", tenant, "err", err)
-		writeError(w, http.StatusServiceUnavailable, "policy_unavailable", "policy store unavailable")
 		return
 	}
 
+	// An endpoint rule needs to know which endpoint. The decision API takes
+	// that as query parameters, because the request it is being asked about is
+	// not the request carrying the question.
+	method := r.URL.Query().Get("method")
+	path := r.URL.Query().Get("path")
+	limits := pol.LimitsFor(method, path)
+
 	res, err := s.checker.Check(r.Context(), limiter.Request{
 		Tenant: tenant,
-		Limits: pol.Limits,
+		Limits: limits,
 		Cost:   cost,
 	})
 	if err != nil {
@@ -288,17 +328,34 @@ func secondsCeil(d time.Duration) int64 {
 	return s
 }
 
-// resolveTenant decides which tenant a request is about.
+// resolveTenant decides which tenant a request speaks for.
 //
-// M3 replaces the header with an authenticated identity; until then the header
-// is trusted only because the config says to, and a config that does not say so
-// refuses rather than guessing.
+// Credentials win over the header. The header is for a decision API called by
+// infrastructure that has already established who the caller is -- an ingress
+// asking "may this through?" -- and trusting it is a deliberate config choice,
+// because anything that can reach the endpoint can otherwise name any tenant
+// and spend its quota.
 func (s *Server) resolveTenant(r *http.Request) (string, error) {
+	if s.authn != nil && s.authn.Enabled() {
+		tenant, err := s.authn.Tenant(r.Context(), r)
+		switch {
+		case err == nil:
+			return tenant, nil
+		case errors.Is(err, auth.ErrBadCredentials):
+			// Presented and wrong is never waved through, whatever the header
+			// says: falling back to the header here would make a bad key a way
+			// of becoming somebody else.
+			return "", err
+		}
+	}
 	if s.cfg.CheckAPI.TrustTenantHeader {
 		if t := r.Header.Get(TenantHeader); t != "" {
 			return t, nil
 		}
 		return "", fmt.Errorf("%s header is required", TenantHeader)
+	}
+	if s.authn != nil && s.authn.Enabled() {
+		return "", auth.ErrNoCredentials
 	}
 	return "", fmt.Errorf("check_api.trust_tenant_header is off and no authentication is configured")
 }

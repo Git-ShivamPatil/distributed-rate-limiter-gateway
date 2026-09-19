@@ -20,8 +20,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	goredis "github.com/redis/go-redis/v9"
 
+	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/auth"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/config"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/gateway"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter"
@@ -95,13 +97,13 @@ func run(args []string) error {
 		return err
 	}
 
-	policies, err := policy.NewStatic(cfg.Policies)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	policies, adminStore, cache, policyReady, err := buildPolicySource(ctx, cfg, log)
 	if err != nil {
 		return err
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	var (
 		checker limiter.Checker
@@ -143,7 +145,28 @@ func run(args []string) error {
 			"addr", cfg.Redis.Addr, "pool_size", cfg.Redis.PoolSize)
 	}
 
-	srv := gateway.New(cfg, checker, policies, log, gateway.WithReadiness(ready))
+	authn, adminToken := buildAuth(cfg, adminStore, log)
+
+	// Readiness means "can this node still enforce", so it covers both stores.
+	limiterReady := ready
+	ready = func(ctx context.Context) error {
+		if err := limiterReady(ctx); err != nil {
+			return err
+		}
+		return policyReady(ctx)
+	}
+
+	serverOpts := []gateway.Option{
+		gateway.WithReadiness(ready),
+		gateway.WithAuth(authn),
+	}
+	if cache != nil {
+		serverOpts = append(serverOpts, gateway.WithCache(cache))
+	}
+	if adminStore != nil {
+		serverOpts = append(serverOpts, gateway.WithAdmin(adminStore, adminToken))
+	}
+	srv := gateway.New(cfg, checker, policies, log, serverOpts...)
 
 	httpSrv := &http.Server{
 		Addr:         cfg.Node.HTTPAddr,
@@ -183,6 +206,91 @@ func run(args []string) error {
 	}
 	log.Info("stopped", "node", cfg.Node.ID)
 	return nil
+}
+
+// buildPolicySource assembles where policies come from.
+//
+// Returns the read side the request path uses, the write side the admin API
+// uses (nil when policies come from the config file and there is nowhere to
+// write), the cache so admin writes can invalidate it, and a readiness check.
+func buildPolicySource(ctx context.Context, cfg config.Config, log *slog.Logger) (
+	policy.Source, gateway.AdminStore, *policy.Cache, func(context.Context) error, error,
+) {
+	noop := func(context.Context) error { return nil }
+
+	switch cfg.Policy.Store {
+	case "postgres":
+		pool, err := pgxpool.New(ctx, cfg.Postgres.DSN)
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("policy store: %w", err)
+		}
+		startCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err = pool.Ping(startCtx)
+		cancel()
+		if err != nil {
+			pool.Close()
+			return nil, nil, nil, nil, fmt.Errorf(
+				"policy store unreachable: %w (is the data plane up? `docker compose up -d redis postgres && make migrate`)", err)
+		}
+
+		repo := policy.NewPostgres(pool)
+		cache := policy.NewCache(repo,
+			policy.WithTTL(cfg.Policy.CacheTTL),
+			policy.WithNegativeTTL(cfg.Policy.NegativeCacheTTL),
+			policy.WithStaleFor(cfg.Policy.StaleFor),
+		)
+
+		if cfg.Policy.ListenForChanges {
+			go policy.NewListener(pool, cache, log).Run(ctx)
+		}
+		log.Info("policy store is postgres",
+			"cache_ttl", cfg.Policy.CacheTTL, "stale_for", cfg.Policy.StaleFor,
+			"listening", cfg.Policy.ListenForChanges)
+		return cache, repo, cache, repo.Ping, nil
+
+	default:
+		static, err := policy.NewStatic(cfg.Policies)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		log.Info("policy store is the config file",
+			"policies", len(cfg.Policies.Named), "tenants", len(cfg.Policies.Tenants))
+		return static, nil, nil, noop, nil
+	}
+}
+
+// buildAuth reads the credentials from the environment.
+//
+// Secrets never come from the config file, which is committed; the file names
+// the variable and this reads it. A missing variable disables that mechanism
+// and says so, rather than silently authenticating nobody.
+func buildAuth(cfg config.Config, store gateway.AdminStore, log *slog.Logger) (*auth.Authenticator, *auth.AdminToken) {
+	var opts []auth.Option
+
+	if cfg.Auth.APIKeys {
+		if resolver, ok := store.(auth.KeyResolver); ok && store != nil {
+			opts = append(opts, auth.WithAPIKeys(resolver))
+			log.Info("api key authentication enabled")
+		} else {
+			log.Info("api key authentication is configured but the policy store cannot resolve keys",
+				"store", cfg.Policy.Store)
+		}
+	}
+	if cfg.Auth.JWTSecretEnv != "" {
+		if secret := os.Getenv(cfg.Auth.JWTSecretEnv); secret != "" {
+			opts = append(opts, auth.WithJWT([]byte(secret),
+				cfg.Auth.JWTIssuer, cfg.Auth.JWTAudience, cfg.Auth.JWTTenantClaim))
+			log.Info("jwt authentication enabled",
+				"claim", cfg.Auth.JWTTenantClaim, "secret", auth.FingerprintSecret([]byte(secret)))
+		}
+	}
+
+	adminToken := auth.NewAdminToken(os.Getenv(cfg.Auth.AdminTokenEnv))
+	if store != nil && !adminToken.Configured() {
+		log.Warn("the admin API is disabled: no admin token is set",
+			"set", cfg.Auth.AdminTokenEnv)
+	}
+	return auth.New(opts...), adminToken
 }
 
 func sweep(ctx context.Context, mem *limiter.Memory, every time.Duration, log *slog.Logger) {

@@ -56,12 +56,27 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 5
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: gateway
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gateway"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
     env:
       REDIS_ADDR: 127.0.0.1:6379
-      # Without this, a runner with no Redis would SKIP the differential test
-      # against the Lua script and still report the suite green -- the failure
-      # mode where CI passes because the interesting tests did not run.
+      POSTGRES_DSN: postgres://gateway:gateway@127.0.0.1:5432/gateway?sslmode=disable
+      # Without these, a runner with no data plane would SKIP the tests that
+      # exercise the Lua script and the policy store, and still report the
+      # suite green -- the failure mode where CI passes because the
+      # interesting tests did not run.
       REDIS_REQUIRED: "1"
+      POSTGRES_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -82,6 +97,18 @@ jobs:
         ports: ["6379:6379"]
         options: >-
           --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: gateway
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gateway"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 5
@@ -117,6 +144,41 @@ jobs:
       - name: dual-node quota
         run: ./scripts/dual-node-quota.sh --requests 1000
 
+  policy-reload:
+    name: A policy edit reaches another node
+    runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: gateway
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gateway"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # Both halves: the edit propagating, and the control with notifications
+      # off that must NOT see it.
+      - name: policy reload
+        run: ./scripts/policy-reload-test.sh
+
   case-study:
     name: The commands the case study publishes
     runs-on: ubuntu-24.04
@@ -129,6 +191,8 @@ jobs:
       # The development machine's Docker is Windows-side and unreachable from
       # the Linux shell the scripts run in, so the compose step can only be
       # exercised here. A published command nobody runs is a published command
-      # that does not work.
+      # that does not work. This job deliberately uses compose rather than
+      # service containers, because compose is what the page tells readers to
+      # run.
       - name: published commands, with docker
         run: ./scripts/case-study-commands-test.sh --with-docker

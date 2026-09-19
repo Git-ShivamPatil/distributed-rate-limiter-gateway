@@ -1,0 +1,47 @@
+# The configuration the HTTP tests run against.
+#
+# It is deliberately its own file rather than the shipped configs/local.yaml:
+# that one reads its policies from Postgres, and these tests are about the HTTP
+# surface, not about the database. The numbers here match the demonstration
+# tenants the migration seeds, so the assertions still describe what a reader
+# gets when they follow the case study.
+
+node:
+  id: gateway-1
+  http_addr: ":8080"
+
+limiter:
+  backend: memory
+
+policy:
+  store: static
+
+policies:
+  default: free
+  named:
+    free:
+      failure_mode: closed
+      limits:
+        - name: per-minute
+          algorithm: token_bucket
+          count: 20
+          period: 1m
+          burst: 20
+    pro:
+      failure_mode: closed
+      limits:
+        - name: per-minute
+          algorithm: token_bucket
+          count: 1000
+          period: 1m
+          burst: 200
+        - name: per-second
+          algorithm: sliding_window
+          count: 25
+          period: 1s
+  tenants:
+    acme: free
+    globex: pro
+
+check_api:
+  trust_tenant_header: true

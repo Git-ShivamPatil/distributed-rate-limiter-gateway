@@ -21,12 +21,56 @@ import (
 
 // Config is the whole configuration file.
 type Config struct {
-	Node     Node     `yaml:"node"`
-	Limiter  Limiter  `yaml:"limiter"`
-	Redis    Redis    `yaml:"redis"`
-	Postgres Postgres `yaml:"postgres"`
-	Policies Policies `yaml:"policies"`
-	CheckAPI CheckAPI `yaml:"check_api"`
+	Node     Node        `yaml:"node"`
+	Limiter  Limiter     `yaml:"limiter"`
+	Redis    Redis       `yaml:"redis"`
+	Postgres Postgres    `yaml:"postgres"`
+	Policies Policies    `yaml:"policies"`
+	Policy   PolicyStore `yaml:"policy"`
+	Auth     Auth        `yaml:"auth"`
+	CheckAPI CheckAPI    `yaml:"check_api"`
+}
+
+// PolicyStore selects where policies come from and how long they are cached.
+type PolicyStore struct {
+	// Store is "static" (the policies section of this file) or "postgres".
+	Store string `yaml:"store"`
+	// CacheTTL is how long a policy is served before being re-read. It is the
+	// upper bound on how long a policy change takes to reach a replica that
+	// did not serve the write -- unless ListenForChanges is on, in which case
+	// it is the bound only when the listener is down.
+	CacheTTL time.Duration `yaml:"cache_ttl"`
+	// NegativeCacheTTL is how long "no such tenant" is remembered. Shorter,
+	// because a tenant that was just created should start working quickly.
+	NegativeCacheTTL time.Duration `yaml:"negative_cache_ttl"`
+	// StaleFor is how long a cached policy may still be served after the store
+	// becomes unreachable. A policy store outage then freezes policy at the
+	// last known version rather than taking enforcement down with it.
+	StaleFor time.Duration `yaml:"stale_for"`
+	// ListenForChanges subscribes to Postgres NOTIFY so an edit reaches every
+	// replica at once instead of when each TTL lapses.
+	ListenForChanges bool `yaml:"listen_for_changes"`
+}
+
+// Auth configures tenant identity and the admin API credential.
+//
+// No secret is ever read from this file. Each field names an ENVIRONMENT
+// VARIABLE holding the secret, because this file is committed to a public
+// repository and a config format that accepts an inline secret will eventually
+// be given one.
+type Auth struct {
+	// APIKeys enables X-API-Key / `Authorization: ApiKey` against the store.
+	APIKeys bool `yaml:"api_keys"`
+	// JWTSecretEnv names the env var holding the HS256 signing secret. Empty
+	// disables JWT authentication.
+	JWTSecretEnv   string `yaml:"jwt_secret_env"`
+	JWTIssuer      string `yaml:"jwt_issuer"`
+	JWTAudience    string `yaml:"jwt_audience"`
+	JWTTenantClaim string `yaml:"jwt_tenant_claim"`
+	// AdminTokenEnv names the env var holding the admin API credential. With
+	// no token the admin API refuses every request rather than serving an
+	// unauthenticated management surface.
+	AdminTokenEnv string `yaml:"admin_token_env"`
 }
 
 // Node identifies this process and where it listens.
@@ -125,9 +169,22 @@ func Defaults() Config {
 			SweepInterval: 30 * time.Second,
 		},
 		Redis: Redis{
-			Addr:     "localhost:6379",
+			Addr:     "127.0.0.1:6379",
 			PoolSize: 64,
 			Timeout:  250 * time.Millisecond,
+		},
+		Policy: PolicyStore{
+			Store:            "static",
+			CacheTTL:         5 * time.Second,
+			NegativeCacheTTL: time.Second,
+			StaleFor:         5 * time.Minute,
+			ListenForChanges: true,
+		},
+		Auth: Auth{
+			APIKeys:        true,
+			JWTSecretEnv:   "GATEWAY_JWT_SECRET",
+			JWTTenantClaim: "tid",
+			AdminTokenEnv:  "GATEWAY_ADMIN_TOKEN",
 		},
 		CheckAPI: CheckAPI{TrustTenantHeader: true},
 	}
@@ -177,6 +234,26 @@ func (c Config) Validate() error {
 	}
 	if c.Limiter.SweepInterval < 0 {
 		return fmt.Errorf("config: limiter.sweep_interval must not be negative")
+	}
+
+	switch c.Policy.Store {
+	case "static", "postgres":
+	default:
+		return fmt.Errorf("config: policy.store %q is not \"static\" or \"postgres\"", c.Policy.Store)
+	}
+	if c.Policy.Store == "postgres" && c.Postgres.DSN == "" {
+		return fmt.Errorf("config: policy.store is postgres but postgres.dsn is empty")
+	}
+	if c.Policy.CacheTTL < 0 || c.Policy.NegativeCacheTTL < 0 || c.Policy.StaleFor < 0 {
+		return fmt.Errorf("config: policy cache durations must not be negative")
+	}
+	if c.Policy.StaleFor > 0 && c.Policy.StaleFor < c.Policy.CacheTTL {
+		return fmt.Errorf("config: policy.stale_for (%s) is shorter than policy.cache_ttl (%s), so serving stale could never happen",
+			c.Policy.StaleFor, c.Policy.CacheTTL)
+	}
+	// A secret in the config file would be a secret in the repository.
+	if strings.Contains(c.Auth.JWTSecretEnv, " ") || strings.HasPrefix(c.Auth.JWTSecretEnv, "-") {
+		return fmt.Errorf("config: auth.jwt_secret_env must name an environment variable, not hold a secret")
 	}
 
 	seen := map[string]bool{}

@@ -1,10 +1,16 @@
 # The configuration the case study runs:
 #
+#   docker compose up -d redis postgres && make migrate
 #   go run ./cmd/gateway --node gateway-1 --config ./configs/local.yaml
 #
 # Every value here has a default in internal/config; this file exists to be
 # read, so it sets them explicitly. An unknown key is a startup error rather
 # than a silently ignored typo.
+#
+# No secret appears in this file. The two that exist -- the JWT signing key and
+# the admin API token -- are named by environment variable below, because this
+# file is committed to a public repository and a config format that accepts an
+# inline secret will eventually be given one.
 
 node:
   id: gateway-1
@@ -33,53 +39,51 @@ redis:
   timeout: 250ms
 
 postgres:
-  # Used from milestone 3. `docker compose up -d redis postgres` starts it.
-  dsn: "postgres://gateway:gateway@localhost:5432/gateway?sslmode=disable"
+  # The policy store. `docker compose up -d redis postgres` starts it and
+  # `make migrate` creates the schema and seeds the two demonstration tenants
+  # this page's commands use, acme and globex.
+  dsn: "postgres://gateway:gateway@127.0.0.1:5432/gateway?sslmode=disable"
 
-policies:
-  # A tenant with no policy of its own gets this one. Remove the line and an
-  # unknown tenant is refused instead -- which is the right setting once real
-  # tenants exist in the policy store.
-  default: free
+policy:
+  # postgres: tenants, policies and API keys live in the database, and can be
+  # changed through the admin API while the gateway runs.
+  #
+  # The alternative, `static`, reads them from a `policies:` block in this file
+  # and needs no database at all -- see scripts/testdata/smoke.yaml for that
+  # shape. It is how the gateway runs in a test, and how it would run in a
+  # deployment whose policies are managed as configuration.
+  store: postgres
 
-  named:
-    free:
-      # Refuse when the counter store cannot be reached. The alternative,
-      # `open`, keeps traffic flowing during a Redis outage and stops enforcing
-      # the limit while it lasts.
-      failure_mode: closed
-      limits:
-        # 20 requests, refilling over a minute, burst 20. A cold tenant can
-        # spend all 20 at once and then waits 3 seconds per request.
-        - name: per-minute
-          algorithm: token_bucket
-          count: 20
-          period: 1m
-          burst: 20
+  # How long a policy is served before it is re-read. With change
+  # notifications on this is the bound only when the listener is down: an edit
+  # normally reaches every replica within milliseconds, because the schema's
+  # triggers publish on a Postgres channel and each node listens.
+  cache_ttl: 5s
+  # "No such tenant" is an answer too, and caching it stops a flood of requests
+  # for an unknown tenant becoming a flood of queries. Shorter, so a tenant
+  # that was just created starts working quickly.
+  negative_cache_ttl: 1s
+  # If the policy store becomes unreachable, keep serving the last known
+  # policies for this long rather than failing every request. A database
+  # outage then freezes policy instead of stopping enforcement.
+  stale_for: 5m
+  listen_for_changes: true
 
-    pro:
-      failure_mode: closed
-      limits:
-        # A generous tenant-wide budget with room for a burst...
-        - name: per-minute
-          algorithm: token_bucket
-          count: 1000
-          period: 1m
-          burst: 200
-        # ...and an exact short-window cap that a burst cannot walk around.
-        # Both have to admit a request, and a request refused by either
-        # consumes from neither.
-        - name: per-second
-          algorithm: sliding_window
-          count: 25
-          period: 1s
-
-  tenants:
-    acme: free
-    globex: pro
+auth:
+  # Resolve the tenant from an API key issued by `gatewayctl apikey create`.
+  # The store holds only a SHA-256 of each key.
+  api_keys: true
+  # HS256 bearer tokens. With the variable unset, JWT authentication is off.
+  jwt_secret_env: GATEWAY_JWT_SECRET
+  jwt_tenant_claim: tid
+  # The admin API refuses every request unless this variable is set, because a
+  # management surface with no credential is worse than no management surface.
+  admin_token_env: GATEWAY_ADMIN_TOKEN
 
 check_api:
-  # The decision endpoint takes the tenant from X-Tenant-ID. That is right for
-  # a limiter called by trusted infrastructure and wrong for traffic off the
-  # internet; milestone 3 adds authenticated tenant identity for the proxy path.
+  # The decision endpoint falls back to X-Tenant-ID when a request carries no
+  # credentials. That is right for a limiter called by trusted infrastructure
+  # -- an ingress asking "may this request through?" -- and wrong for traffic
+  # off the internet, where anything that can reach the endpoint could name any
+  # tenant and spend its quota. Credentials, when present, always win.
   trust_tenant_header: true

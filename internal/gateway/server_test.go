@@ -14,11 +14,18 @@ import (
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/policy"
 )
 
+// testConfig loads the fixture these tests drive the HTTP surface with.
+//
+// Not the shipped configs/local.yaml: that reads its policies from Postgres,
+// and these tests are about the handlers. The limits here are the same ones
+// the migration seeds for the demonstration tenants, so the numbers asserted
+// below are still the numbers the case study prints -- and the migration is
+// checked against them directly in the policy package's own tests.
 func testConfig(t *testing.T) config.Config {
 	t.Helper()
-	cfg, err := config.Load("../../configs/local.yaml")
+	cfg, err := config.Load("testdata/gateway.yaml")
 	if err != nil {
-		t.Fatalf("loading configs/local.yaml: %v", err)
+		t.Fatalf("loading testdata/gateway.yaml: %v", err)
 	}
 	return cfg
 }

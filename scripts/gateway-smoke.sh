@@ -74,6 +74,12 @@ header_value() { # $1 = header name, $2 = response headers
 echo "=== build ==="
 go build -o "${BIN}" ./cmd/gateway || exit 1
 
+# The shipped config reads its policies from Postgres, so the schema and the
+# demonstration tenants have to exist before phase 1 can run. This is the same
+# `make migrate` the case study prints as step one.
+echo "=== migrate ==="
+go run ./cmd/gatewayctl migrate up --config ./configs/local.yaml || exit 1
+
 # ---------------------------------------------------------------- phase 1 ---
 # The numbers the case study puts on the page, against the config it names.
 echo
@@ -89,20 +95,39 @@ if ! grep -q 'limiter backend is redis' "${LOG}"; then
   fail=1
 fi
 
+# The two tenants here come from the migration, not from a config file: the
+# shipped config reads its policies from Postgres.
+#
+# Counters now outlive the process that made them, so the burst below starts by
+# clearing this tenant's. Without that, a second run inside a minute sees a
+# bucket that has only partly refilled and an exact count means nothing -- the
+# first version of this test passed twice by luck and then failed.
+go run ./cmd/gatewayctl counters reset --config ./configs/local.yaml --tenant acme >/dev/null || exit 1
+go run ./cmd/gatewayctl counters reset --config ./configs/local.yaml --tenant globex >/dev/null || exit 1
+
 # 20 tokens per minute is one token every 3 seconds, so an exact 20/10 split is
 # only valid while the loop stays inside that interval.
 scripts/burst-check.sh --url "${URL}" --tenant acme \
   --requests 30 --expect-allowed 20 --expect-denied 10 --max-seconds 2 || fail=1
 
-# A different tenant on the same policy is untouched by that flood.
-scripts/burst-check.sh --url "${URL}" --tenant quiet-neighbour \
-  --requests 20 --expect-allowed 20 --expect-denied 0 --max-seconds 2 || fail=1
-
-# The pro policy's 25-per-second window refuses before its per-minute bucket
-# does. How many get through depends on how long the loop takes, so the
-# assertion is a floor and a refusal, not an exact count.
+# acme is now exhausted. globex is on its own policy and its own counters, so
+# the flood above must not have cost it anything -- the noisy-neighbour case,
+# run in the order that makes it meaningful. Its 25-per-second window refuses
+# before its per-minute bucket does, and how many get through depends on how
+# long the loop takes, so the assertion is a floor and a refusal.
 scripts/burst-check.sh --url "${URL}" --tenant globex \
   --requests 40 --min-allowed 25 --min-denied 1 || fail=1
+
+echo "--- an unknown tenant is refused, not given a free pass ---"
+# With policies in the database and no catch-all, a tenant nobody created has
+# no limits -- and a limiter that treats "no limits" as "unlimited" turns a
+# typo in a tenant id into uncapped traffic.
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+  -H 'X-Tenant-ID: nobody-created-this' "${URL}/v1/check")
+if [ "${code}" != "404" ]; then
+  echo "FAIL: an unknown tenant answered ${code}, expected 404" >&2
+  fail=1
+fi
 
 stop_gateway
 

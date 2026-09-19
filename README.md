@@ -5,7 +5,7 @@
 **Multi-tenant gateway · token-bucket and sliding-window quotas · consistent-hash shard ring · Raft election over shard failure**
 
 ![status](https://img.shields.io/badge/status-in_development-111111?style=flat-square)
-![progress](https://img.shields.io/badge/milestones-2_of_9-4a4a4a?style=flat-square)
+![progress](https://img.shields.io/badge/milestones-3_of_9-4a4a4a?style=flat-square)
 ![licence](https://img.shields.io/badge/licence-MIT-767676?style=flat-square)
 
 ![Go](https://img.shields.io/badge/Go-1.27--000000?style=flat-square&logo=go&logoColor=white)
@@ -19,7 +19,7 @@
 ---
 
 > [!IMPORTANT]
-> **2 of 9 milestones complete.** A node enforces per-tenant quotas over REST, and replicas sharing one Redis enforce **one** quota between them rather than one each. `45K req/s · <8ms p99` is a target, not a measurement; nothing is benchmarked yet. Every number lands in [CLAIMS.md](CLAIMS.md) first, with its commit, host and caveat.
+> **3 of 9 milestones complete.** Replicas sharing one Redis enforce **one** quota between them; tenants, policies and API keys live in Postgres and can be changed while the gateway runs. `45K req/s · <8ms p99` is a target, not a measurement; nothing is benchmarked yet. Every number lands in [CLAIMS.md](CLAIMS.md) first, with its commit, host and caveat.
 
 ## Problem
 
@@ -28,7 +28,7 @@ Keep per-tenant quotas accurate across replicas while a noisy neighbour, a lost 
 ## Run what exists today
 
 ```bash
-docker compose up -d redis postgres                                   # 1. the data plane
+docker compose up -d redis postgres && make migrate                   # 1. data plane + schema
 go run ./cmd/gateway --node gateway-1 --config ./configs/local.yaml   # 2. a node
 curl -si -H 'X-Tenant-ID: acme' localhost:8080/v1/check               # 3. a decision
 ```
@@ -44,7 +44,9 @@ limiter that silently stops limiting is worse than one that will not boot.
 | `--config` | the YAML above; an unknown key is a startup error, not a silent no-op |
 | `--http-addr` | overrides the listen address for a second local node |
 | `GET /v1/check` | the decision: `200` or `429`, every evaluated limit in the body |
-| `GET /healthz` `/readyz` | is this process up, and can it still reach its counter store |
+| `GET /healthz` `/readyz` | is this process up, and can it still reach its stores |
+| `/admin/v1/...` | tenants, policies and API keys, behind an admin token |
+| `gatewayctl` | `migrate up`, `apikey create`, `counters reset` |
 
 **Two algorithms.** A token bucket, stored as GCRA — one timestamp rather than a
 `(tokens, last_refill)` pair, which makes a full bucket and an absent key the
@@ -67,6 +69,26 @@ mechanism is removed is not evidence that the mechanism works. The Lua script
 is also differentially tested against the Go implementation over several
 thousand random operations — both driven by one clock, required to agree on
 every field of every decision.
+
+**Policies are rows, not config.** `make migrate` creates the schema and seeds
+the two tenants the commands above use. Named policies, per-endpoint rules,
+tenants and API keys are all editable through `/admin/v1` while the gateway
+runs, and every node keeps them in an in-process cache, so a check costs no
+database round trip. A policy store that goes down freezes policy at the last
+known version rather than stopping enforcement.
+
+**An edit has to reach the replicas that did not serve it.** The schema's
+triggers publish on a Postgres channel and every node listens, so a change
+lands in milliseconds; the cache TTL is the bound only when that listener is
+down. `scripts/policy-reload-test.sh` proves it across two nodes whose caches
+hold for an hour — then runs the same scenario with notifications switched off,
+where the second node **must** keep enforcing the old policy. Without that
+half, the first half would only show that something changed, not why.
+
+**Identity.** An API key (stored only as its SHA-256) or an HS256 bearer token
+names the tenant; the admin API has its own token. No secret appears in a
+config file — each is named by environment variable, and a test fails the build
+if the shipped config ever starts carrying one.
 
 ## Architecture
 
@@ -103,11 +125,11 @@ Raft governs **membership and ring ownership only**, never per-request counters 
 
 ## Roadmap
 
-`[█████░░░░░░░░░░░░░░░░░░░] 2/9` — ticked only when the verification step passes, not when the code is written.
+`[████████░░░░░░░░░░░░░░░░] 3/9` — ticked only when the verification step passes, not when the code is written.
 
 - [x] **M1 · Skeleton, config, single-node token bucket that says 429** — one process enforces an in-memory per-tenant bucket over REST, on the advertised config path and flags.
 - [x] **M2 · Redis-backed token bucket and sliding window** — both strategies as single-round-trip atomic Lua; two processes sharing one Redis enforce one quota.
-- [ ] **M3 · Postgres policy store, tenant auth, hot-reloading cache** — per-tenant and per-endpoint policies in Postgres, served from an in-process cache; `make migrate` works as advertised.
+- [x] **M3 · Postgres policy store, tenant auth, hot-reloading cache** — per-tenant and per-endpoint policies in Postgres, served from an in-process cache; `make migrate` works as advertised.
 - [ ] **M4 · gRPC contract and the actual gateway data path** — authenticates, routes, applies policy and proxies upstream; same decisions over gRPC.
 - [ ] **M5 · Consistent-hash ring with cross-node forwarding** — a tenant always lands on the same shard; a node that does not own it forwards over gRPC.
 - [ ] **M6 · Raft membership and leader election** — ring ownership survives a node dying; enforcement continues with quota accuracy across the rebalance.

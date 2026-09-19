@@ -86,16 +86,29 @@ else
 fi
 
 echo "--- make migrate ---"
-if make migrate >/dev/null 2>&1; then
+if make migrate; then
   echo "make migrate succeeded"
+  # The page's step 1 is two commands joined by &&, so migrate has to be
+  # re-runnable: anyone who runs step 1 twice must not be told it failed.
+  if make migrate; then
+    echo "make migrate is idempotent"
+  else
+    echo 'FAIL: a second "make migrate" failed; step 1 cannot be run twice' >&2
+    fail=1
+  fi
 else
-  echo "PENDING: make migrate is not implemented yet (milestone 3)."
+  echo "FAIL: make migrate failed" >&2
+  fail=1
 fi
 
 echo
 echo "=== step 2: go run ./cmd/gateway --node gateway-1 --config ./configs/local.yaml ==="
-# Exactly the published command, with the published flag form, and with the
-# published listen address taken from the published config file.
+# Exactly the published command, with the published flag form and the published
+# listen address from the published config file.
+#
+# This is also where step 1 stops being decorative: the shipped config reads its
+# policies from the database step 1 migrated, and the gateway refuses to start
+# if it cannot reach Redis. Skip step 1 and this fails.
 go run ./cmd/gateway --node gateway-1 --config ./configs/local.yaml >"${LOG}" 2>&1 &
 GATEWAY_PID=$!
 
@@ -111,6 +124,12 @@ if [ "${ready}" -ne 1 ]; then
   exit 1
 fi
 echo "gateway answers on ${URL}"
+
+# The page's numbers describe a cold bucket -- what a reader gets when they
+# start the stack and run the loop. Counters live in Redis and outlive the
+# gateway, so clear this tenant's before asserting an exact split; otherwise a
+# second run inside a minute measures a partly refilled bucket.
+go run ./cmd/gatewayctl counters reset --config ./configs/local.yaml --tenant acme >/dev/null || fail=1
 
 # The milestone's own check, written the way its verification step writes it.
 echo "--- for i in \$(seq 1 30); do curl ... /v1/check; done | sort | uniq -c ---"

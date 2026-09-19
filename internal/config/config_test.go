@@ -1,11 +1,10 @@
 package config
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter"
 )
 
 // The file the case study tells a reader to run has to load, validate, and mean
@@ -27,28 +26,52 @@ func TestLocalConfigLoads(t *testing.T) {
 		t.Errorf("read_timeout = %s, want 5s -- duration strings must parse", cfg.Node.ReadTimeout)
 	}
 
-	free, ok := cfg.Policies.Named["free"]
-	if !ok {
-		t.Fatal("policy free is missing")
+	// The shipped config is the shared, database-backed one: that is what
+	// makes `docker compose up -d redis postgres && make migrate` load-bearing
+	// rather than decorative.
+	if cfg.Limiter.Backend != "redis" {
+		t.Errorf("limiter.backend = %q, want redis", cfg.Limiter.Backend)
 	}
-	if len(free.Limits) != 1 {
-		t.Fatalf("policy free has %d limits, want 1", len(free.Limits))
+	if cfg.Policy.Store != "postgres" {
+		t.Errorf("policy.store = %q, want postgres", cfg.Policy.Store)
 	}
-	l := free.Limits[0]
-	if l.Algorithm != limiter.AlgorithmTokenBucket || l.Count != 20 || l.Period != time.Minute || l.Burst != 20 {
-		t.Errorf("free limit = %+v, want a 20-token bucket per minute (what the milestone verifies)", l)
+	if cfg.Postgres.DSN == "" {
+		t.Error("postgres.dsn is empty, so `make migrate` has nowhere to go")
 	}
-	if cfg.Policies.Tenants["acme"] != "free" {
-		t.Errorf("tenant acme = %q, want free", cfg.Policies.Tenants["acme"])
+	if !cfg.Policy.ListenForChanges {
+		t.Error("policy.listen_for_changes is off, so an edit would take a whole TTL to reach another replica")
+	}
+	if cfg.Policy.StaleFor <= cfg.Policy.CacheTTL {
+		t.Errorf("stale_for %s is not longer than cache_ttl %s, so serving stale could never happen",
+			cfg.Policy.StaleFor, cfg.Policy.CacheTTL)
+	}
+}
+
+// The shipped config must not contain a secret. It names the environment
+// variables instead, and this is the check that keeps it that way.
+func TestLocalConfigHoldsNoSecrets(t *testing.T) {
+	raw, err := os.ReadFile("../../configs/local.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Auth.JWTSecretEnv == "" || cfg.Auth.AdminTokenEnv == "" {
+		t.Fatal("the config does not name the environment variables its secrets come from")
 	}
 
-	pro := cfg.Policies.Named["pro"]
-	var algorithms []limiter.Algorithm
-	for _, l := range pro.Limits {
-		algorithms = append(algorithms, l.Algorithm)
+	text := strings.ToLower(string(raw))
+	for _, needle := range []string{"jwt_secret:", "admin_token:", "password:", "secret_key"} {
+		if strings.Contains(text, needle) {
+			t.Errorf("configs/local.yaml contains %q, which reads like an inline secret", needle)
+		}
 	}
-	if len(algorithms) != 2 || algorithms[0] != limiter.AlgorithmTokenBucket || algorithms[1] != limiter.AlgorithmSlidingWindow {
-		t.Errorf("policy pro algorithms = %v, want both strategies so the shipped config exercises each", algorithms)
+	// The Postgres DSN carries the demo password, which is fine because it is
+	// the compose file's published one -- but it must be the compose one.
+	if !strings.Contains(cfg.Postgres.DSN, "gateway:gateway@") {
+		t.Error("the DSN's credentials are not the compose file's demonstration pair; a real one may have been committed")
 	}
 }
 
