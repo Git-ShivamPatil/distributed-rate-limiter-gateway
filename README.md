@@ -314,6 +314,49 @@ flowchart LR
 
 Raft governs **membership and ring ownership only**, never per-request counters — per-request consensus would destroy the latency budget. The consequence is stated rather than hidden: quota is not strictly consistent across a rebalance window.
 
+### The one Redis setting this depends on
+
+```
+maxmemory-policy noeviction
+```
+
+The gateway **refuses to start** against a Redis that may evict, and says which
+setting to change. That is not fussiness about configuration; it is the one
+failure in this system that is completely silent.
+
+Every other failure here is loud. A store that cannot be reached returns an
+error and the tenant's failure mode decides what it means. A store that was
+wiped fails a generation check and the node refuses everything until the
+cluster agrees. A node carrying a stale policy is refused by the store itself.
+An **evicted counter** is none of those: the key is simply gone, and an absent
+key is indistinguishable from a full bucket -- deliberately, because that is
+exactly what lets a TTL expire a counter safely. So a tenant sitting at its
+limit quietly gets a fresh quota, nothing errors, nothing is logged, every test
+still passes, and the first symptom is a number on a bill.
+
+The generation fence has its own version of the same problem, and it fails the
+other way. Losing `limiter:store:gen` alone -- which eviction can do, while the
+per-tenant keys survive -- leaves the cluster minting a higher generation while
+every existing tenant still carries the old one, and a tenant in that state is
+refused until somebody clears it by hand. A full flush does not do this,
+because the per-tenant keys go too and are adopted. Neither outcome is
+acceptable, and neither is possible under `noeviction`.
+
+Three things enforce it rather than one, because a precondition nobody verifies
+is a precondition that drifts:
+
+- `docker-compose.yml` sets it explicitly rather than relying on the default.
+- The gateway reads `maxmemory-policy` and `maxmemory` at startup and refuses
+  on a combination that can actually evict. A policy of `allkeys-lru` with no
+  memory limit evicts nothing today, so that is a **warning**, not a refusal --
+  rejecting a server that is genuinely safe would be its own kind of wrong.
+- A test reconfigures a real Redis to evict, requires the verdict to flip, and
+  puts it back.
+
+A managed Redis that refuses `CONFIG GET` is reported as unknown and allowed to
+start. Several providers disable the command, and a limiter that would not run
+against them would be trading a real deployment for a check it cannot perform.
+
 ## What the fences do not cover
 
 - **Redis is one unreplicated instance**, and the log does not change that. The
@@ -332,8 +375,13 @@ Raft governs **membership and ring ownership only**, never per-request counters 
 - **`check.lua` still ships a clock-override branch** for the differential test
   against the Go oracle. It is unreachable from the production constructor, and
   it should be a build-time split rather than a runtime argument.
-- **Nothing here exercises boltdb recovery from an unclean stop.** Every
-  restart the tests perform is a clean one.
+- **Nothing here exercises boltdb recovery from an unclean stop.** A node does
+  restart over a real log and recover what it committed; the stop it recovers
+  from is always a clean one.
+- **`noeviction` is checked at startup, not continuously.** Somebody can change
+  it with `CONFIG SET` on a running server, and nothing would notice until the
+  next restart. The `evicted_keys` count is reported at boot, which turns that
+  into something visible after the fact rather than never.
 
 ## Scope
 

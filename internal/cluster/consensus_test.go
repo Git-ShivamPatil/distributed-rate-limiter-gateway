@@ -707,12 +707,25 @@ func TestANodeRestartsOverItsOwnLogWithoutBootstrappingAgain(t *testing.T) {
 	t.Cleanup(func() { _ = second.Close() })
 	waitLeader(second)
 
-	after, err := second.State().Encode()
-	if err != nil {
-		t.Fatal(err)
+	// Winning an election is not the same as having replayed the log. A node
+	// is leader as soon as it has the votes; its state machine catches up
+	// afterwards, and on a loaded machine that gap is wide enough to read an
+	// empty state through. So wait for the CONDITION -- the state matching --
+	// rather than for leadership, which is a different fact.
+	var after []byte
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		after, err = second.State().Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(after) == string(before) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if string(after) != string(before) {
-		t.Fatalf("a restart did not recover what was committed:\n before %s\n after  %s", before, after)
+		t.Fatalf("a restart did not recover what was committed within 30s:\n before %s\n after  %s", before, after)
 	}
 	if got := second.State().StoreGen; got != 17 {
 		t.Fatalf("the store generation came back as %d, want 17", got)

@@ -185,10 +185,40 @@ func run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("%w (is the data plane up? `docker compose up -d redis postgres`)", err)
 		}
+		// A Redis that may evict is a Redis that may hand a tenant a fresh
+		// quota without telling anyone. An evicted counter is indistinguishable
+		// from a full bucket -- deliberately, because that is what lets a TTL
+		// expire one safely -- so nothing errors, nothing is logged, and the
+		// only symptom is a number in a bill. It is checked here rather than
+		// documented, because a precondition nobody verifies is a precondition
+		// that drifts.
+		evictCtx, evictCancel := context.WithTimeout(ctx, 5*time.Second)
+		eviction := rc.Eviction(evictCtx)
+		evictCancel()
+
+		switch {
+		case eviction.Fatal():
+			return fmt.Errorf("redis at %s may evict keys (%s); an evicted counter is "+
+				"indistinguishable from a full bucket, so a tenant at its limit would silently "+
+				"get a fresh quota and nothing would report it -- set `maxmemory-policy "+
+				"noeviction`, or remove the `maxmemory` limit",
+				cfg.Redis.Addr, eviction)
+		case eviction.Latent():
+			log.Warn("redis is not set to noeviction; it evicts nothing today only because maxmemory is unset, and setting one would silently reset counters",
+				"policy", eviction.Policy)
+		case !eviction.Known:
+			log.Warn("could not read this redis's maxmemory policy, so whether it may discard counters is unknown",
+				"addr", cfg.Redis.Addr)
+		}
+		if eviction.Evicted > 0 {
+			log.Warn("this redis has already evicted keys since it started; any counter among them was a silent quota reset",
+				"evicted_keys", eviction.Evicted)
+		}
+
 		checker = rc
 		ready = rc.Ping
 		log.Info("limiter backend is redis: replicas sharing this Redis enforce one quota",
-			"addr", cfg.Redis.Addr, "pool_size", cfg.Redis.PoolSize)
+			"addr", cfg.Redis.Addr, "pool_size", cfg.Redis.PoolSize, "eviction", eviction.String())
 	}
 
 	authn, adminToken := buildAuth(cfg, adminStore, log)

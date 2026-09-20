@@ -45,7 +45,12 @@ services:
     # No persistence: these are rate-limit counters. Every key has a TTL equal
     # to the moment its state stops meaning anything, so a restart costs at
     # most one window of enforcement and never over-admits beyond it.
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # noeviction is not decoration and not the default being restated for
+    # tidiness: an evicted counter is indistinguishable from a full bucket, so
+    # a tenant at its limit would silently get a fresh quota. The gateway
+    # refuses to start against a Redis that may evict, and this is what keeps
+    # that from being an inconvenience.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
     ports:
       - "6379:6379"
     healthcheck:
