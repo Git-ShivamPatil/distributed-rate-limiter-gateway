@@ -5,7 +5,7 @@
 **Multi-tenant gateway · token-bucket and sliding-window quotas · consistent-hash shard ring · Raft election over shard failure**
 
 ![status](https://img.shields.io/badge/status-in_development-111111?style=flat-square)
-![progress](https://img.shields.io/badge/milestones-5_of_9-4a4a4a?style=flat-square)
+![progress](https://img.shields.io/badge/milestones-6_of_9-4a4a4a?style=flat-square)
 ![licence](https://img.shields.io/badge/licence-MIT-767676?style=flat-square)
 
 ![Go](https://img.shields.io/badge/Go-1.27-000000?style=flat-square&logo=go&logoColor=white)
@@ -19,7 +19,7 @@
 ---
 
 > [!IMPORTANT]
-> **5 of 9 milestones complete.** A gateway, not only a limiter: it authenticates, routes, limits and proxies, and answers over REST and gRPC. Replicas sharing one Redis enforce **one** quota between them, a consistent-hash ring decides which node coordinates each tenant, and policies live in Postgres and can be changed while it runs. `45K req/s · <8ms p99` is a target, not a measurement; nothing is benchmarked yet. Every number lands in [CLAIMS.md](CLAIMS.md) first, with its commit, host and caveat.
+> **6 of 9 milestones complete.** A gateway, not only a limiter: it authenticates, routes, limits and proxies, and answers over REST and gRPC. Replicas sharing one Redis enforce **one** quota between them, a consistent-hash ring decides which node coordinates each tenant, and policies live in Postgres and can be changed while it runs. Membership is committed through Raft, losing the leader under load is an election rather than an outage, and a tightened limit cannot be outrun by a node still holding the old one. `45K req/s · <8ms p99` is a target, not a measurement; nothing is benchmarked yet. Every number lands in [CLAIMS.md](CLAIMS.md) first, with its commit, host and caveat.
 
 ## Problem
 
@@ -206,6 +206,82 @@ forward is decided locally against the same Redis and counted. Membership
 changes are graceful and commanded, and the README would rather say so than
 imply a liveness mechanism that is not there.
 
+### Two fences, and why it takes two
+
+Not every node is up to date at the same instant, and two of those gaps are
+over-admissions rather than inconveniences.
+
+**A limit that tightened.** Postgres `LISTEN/NOTIFY` tells every node that a
+policy changed, but it gives no ordering across them: a node whose listener is
+down, or whose cache has not lapsed, is holding the old limit and has no way to
+know. It supplies that limit to a script which trusts its caller, and for the
+whole skew window the cluster enforces `max(old, new)` -- which for a tightening
+is an over-admission nobody sees. A policy edit therefore mints the next
+generation through the log, and the cache stamps that number onto the copy it
+fetched. The stamp is read **before** the fetch, not after: a bump that commits
+while the query is in flight belongs to an edit that read may not have seen, so
+stamping the new number onto the old limits would present them as current --
+the one mistake a fence cannot catch, because it trusts the number it is given.
+Reading first can only under-stamp, and an under-stamped copy is refused,
+refreshed and retried.
+
+Two mechanisms act on it, and they cover different halves:
+
+1. **The node checks its own copy** against the newest generation the cluster
+   has minted, and refreshes before enforcing anything older.
+2. **Redis refuses a check** carrying a generation below the one already
+   enforced for that tenant.
+
+It needs both, and the reason is this project's own architecture rather than
+anything in the literature. A tenant's checks are coordinated by **one** node,
+so the owner is the only node whose generation ever reaches the counter store
+for that tenant -- nothing else is in a position to contradict it. The
+self-check is what covers a stale owner in the steady state; the store-side
+fence is what covers a node whose idea of the newest generation is itself out
+of date, because it is cut off from the log but not from Redis. That was not
+the plan going in: the scenario below was written expecting the store-side
+fence alone to do it, and it admitted 300 against a limit of 100 until the
+self-check was added.
+
+```bash
+scripts/policy-skew-test.sh            # 99 admitted against a tightened 100
+scripts/policy-skew-test.sh --control  # 300, with no generation minted
+```
+
+The pinned node has to **own** the tenant, and the script picks one it does --
+a node that does not own a tenant forwards its checks to the node that does,
+which is not stale, so the scenario would have passed while testing nothing.
+
+**A counter store that is not the one we think it is.** Redis has no identity
+that survives being emptied: a store that was flushed and came back looks
+exactly like a store nobody has used yet, and every tenant silently gets a
+fresh quota. The most likely way to lose everything does not even change
+Redis's `run_id` -- the test measures this rather than assuming it -- so a
+detector watching only that would see a perfectly healthy store. The marker is
+a generation minted once per lifetime of the store, with the candidate always
+one above the highest the cluster has ever committed, so the high-water mark
+lives somewhere the flush cannot reach and the generation after a wipe always
+outranks the one before it.
+
+Detection is three conditions, any of which fires: the run id changed, the
+generation key is absent, or its value differs from the committed one. When one
+does, this node refuses **every** tenant, not only the ones it has seen. The
+generation names the whole store and the probe fires before it could know which
+tenants were touched; refusing only the tenants that happen to check in next
+would leave every quiet one un-fenced and make the size of the amnesty a
+function of traffic rather than a constant. The cost is real and worth saying
+out loud: a `FLUSHDB` on a shared Redis takes the gateway to `503` until the
+cluster agrees on a new generation.
+
+```bash
+scripts/store-wipe-test.sh            # detected in ~400ms, 0 admitted while blocked
+scripts/store-wipe-test.sh --control  # unnoticed, and the quota comes back in silence
+```
+
+It is a **limitation test**. Nothing survives losing every counter; what it
+shows is that the loss is detected, refused while it lasts, counted, and
+bounded by the detection window rather than by luck.
+
 ## Architecture
 
 ```mermaid
@@ -231,6 +307,27 @@ flowchart LR
 
 Raft governs **membership and ring ownership only**, never per-request counters — per-request consensus would destroy the latency budget. The consequence is stated rather than hidden: quota is not strictly consistent across a rebalance window.
 
+## What the fences do not cover
+
+- **Redis is one unreplicated instance**, and the log does not change that. The
+  generation makes losing it *visible*; it does not make it survivable.
+- **A single node is unfenced**, because zero means unfenced everywhere in this
+  system. The command the case study publishes runs one node against one Redis,
+  where there is nobody to be out of step with.
+- **An admin write is two commits, and they are not atomic.** The edit goes to
+  Postgres first and the generation is minted second, so a crash between them
+  leaves that one edit live but un-fenced -- the behaviour this gateway had
+  before fences existed. The other order would mint a generation for an edit
+  that never happened.
+- **A policy edit is minted through the leader.** A write that lands on a
+  follower answers `409` naming the leader, and says plainly that the edit was
+  written and is not yet fenced.
+- **`check.lua` still ships a clock-override branch** for the differential test
+  against the Go oracle. It is unreachable from the production constructor, and
+  it should be a build-time split rather than a runtime argument.
+- **Nothing here exercises boltdb recovery from an unclean stop.** Every
+  restart the tests perform is a clean one.
+
 ## Scope
 
 **Dual limiting strategies.** Token-bucket for smooth burst control, an exact sliding-window log for stricter endpoint policies. Both are single-round-trip atomic Lua, so two gateway processes sharing one Redis enforce one quota, not two.
@@ -241,14 +338,14 @@ Raft governs **membership and ring ownership only**, never per-request counters 
 
 ## Roadmap
 
-`[█████████████░░░░░░░░░░░] 5/9` — ticked only when the verification step passes, not when the code is written.
+`[████████████████░░░░░░░░] 6/9` — ticked only when the verification step passes, not when the code is written.
 
 - [x] **M1 · Skeleton, config, single-node token bucket that says 429** — one process enforces an in-memory per-tenant bucket over REST, on the advertised config path and flags.
 - [x] **M2 · Redis-backed token bucket and sliding window** — both strategies as single-round-trip atomic Lua; two processes sharing one Redis enforce one quota.
 - [x] **M3 · Postgres policy store, tenant auth, hot-reloading cache** — per-tenant and per-endpoint policies in Postgres, served from an in-process cache; `make migrate` works as advertised.
 - [x] **M4 · gRPC contract and the actual gateway data path** — authenticates, routes, applies policy and proxies upstream; same decisions over gRPC.
 - [x] **M5 · Consistent-hash ring with cross-node forwarding** — a tenant always lands on the same shard; a node that does not own it forwards over gRPC.
-- [ ] **M6 · Raft membership and leader election** — *in progress.* Membership and ring configuration are committed through Raft, and killing the leader under load is an election rather than an outage, with a control that breaks when consensus is moved onto the request path. Still owed: the policy-generation and store-generation fences inside the Lua script.
+- [x] **M6 · Raft membership and leader election** — membership and ring configuration are committed through Raft; killing the leader under load is an election, not an outage; and a tightened limit cannot be outrun by a node still holding the old one.
 - [ ] **M7 · Prometheus, Grafana, live React dashboard** — every decision observable; per-tenant headroom exactly as advertised.
 - [ ] **M8 · Benchmark harness and honest tuning** — a defensible throughput and p99 on real hardware, methodology written down, or the claim corrected.
 - [ ] **M9 · Kubernetes deployment and chaos under load** — the whole stack on a cluster, surviving a pod deletion mid-load.
