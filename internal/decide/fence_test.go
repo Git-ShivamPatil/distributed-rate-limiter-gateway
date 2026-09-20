@@ -334,3 +334,95 @@ func TestOwnershipIsResolvedForTheTenantAlone(t *testing.T) {
 		}
 	}
 }
+
+// recordingGuard is a store guard that says what was asked of it.
+type recordingGuard struct {
+	mu      sync.Mutex
+	blocked error
+	fenced  []string
+}
+
+func (g *recordingGuard) Check() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.blocked
+}
+
+func (g *recordingGuard) Fence(reason string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.fenced = append(g.fenced, reason)
+	g.blocked = errors.New("latched: " + reason)
+}
+
+func (g *recordingGuard) timesFenced() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.fenced)
+}
+
+// countingSource says whether the policy was ever looked up.
+type countingSource struct {
+	p       policy.Policy
+	lookups atomic.Int64
+}
+
+func (s *countingSource) Lookup(context.Context, string) (policy.Policy, error) {
+	s.lookups.Add(1)
+	return s.p, nil
+}
+
+// The in-band half of "fail closed globally". The out-of-band probe is covered
+// by scripts/store-wipe-test.sh; this is the other path, where the SCRIPT is
+// what discovers the store is not the one this node's generation was minted
+// for, in the middle of a check.
+//
+// One store, one answer: a node that has just been told a tenant's counters
+// belong to a different generation has no business serving the next tenant as
+// though nothing had happened. Before this test existed, deleting the
+// guard.Fence call left nothing red.
+func TestAStoreResetFromTheScriptLatchesTheWholeNode(t *testing.T) {
+	guard := &recordingGuard{}
+	fence := &limiter.FenceError{Kind: limiter.ErrStoreReset, Sent: 2, Stored: 1}
+	s := New(&fencingChecker{err: fence, refuseFor: 1000}, &source{p: failOpen("free")}, "node-a",
+		WithStoreGuard(guard))
+
+	if _, err := s.Decide(context.Background(), Query{Tenant: "acme"}); !errors.Is(err, ErrFenced) {
+		t.Fatalf("the store-reset answered %v, want ErrFenced", err)
+	}
+	if got := guard.timesFenced(); got != 1 {
+		t.Fatalf("the guard was fenced %d times; the script's refusal must latch the node", got)
+	}
+
+	// And the latch now covers a DIFFERENT tenant, which is what "global"
+	// means. This one never reaches the store at all.
+	if _, err := s.Decide(context.Background(), Query{Tenant: "globex"}); !errors.Is(err, ErrFenced) {
+		t.Fatalf("a second tenant answered %v after the node latched, want ErrFenced", err)
+	}
+}
+
+// A latched guard refuses BEFORE the policy is looked up and before the ring is
+// consulted. Every node reads the same counter store, so a node that has been
+// told the store was replaced cannot fix it by asking a different node, and
+// must not spend a database round trip finding that out.
+func TestALatchedGuardRefusesBeforeAnythingElseHappens(t *testing.T) {
+	guard := &recordingGuard{blocked: errors.New("the store is not the one the cluster agreed on")}
+	src := &countingSource{p: failOpen("free")}
+	view := &countingView{self: "node-a"}
+
+	s := New(&fencingChecker{refuseFor: 0}, src, "node-a",
+		WithStoreGuard(guard), WithRing(view, nilForwarder{}))
+
+	if _, err := s.Decide(context.Background(), Query{Tenant: "acme"}); !errors.Is(err, ErrFenced) {
+		t.Fatalf("a latched node answered %v, want ErrFenced", err)
+	}
+	if got := src.lookups.Load(); got != 0 {
+		t.Fatalf("the policy was looked up %d times by a node that must not decide", got)
+	}
+	if got := len(view.seen()); got != 0 {
+		t.Fatalf("ownership was resolved %d times; a latched node must not forward either, because every node reads the same store", got)
+	}
+	if s.Stats().StoreFenced == 0 {
+		t.Fatal("the refusal was not counted")
+	}
+}

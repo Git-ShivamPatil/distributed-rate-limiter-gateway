@@ -101,6 +101,29 @@ func (c *Checker) Check(ctx context.Context, req limiter.Request) (limiter.Resul
 		return limiter.Result{Allowed: true}, nil
 	}
 
+	keys, argv, err := c.callArgs(req, cost)
+	if err != nil {
+		return limiter.Result{}, err
+	}
+
+	raw, err := c.script.Run(ctx, c.client, keys, argv...).Result()
+	if err != nil {
+		return limiter.Result{}, fmt.Errorf("redis: check: %w", err)
+	}
+	return parseResult(raw, req)
+}
+
+// callArgs builds exactly what the script is called with.
+//
+// It is separate from Check so that the clock argument can be ASSERTED rather
+// than described. ARGV[5] is the clock override, and in a production Checker it
+// is always 0 -- which is what makes the script read Redis's own TIME. That
+// matters because replicas drift: a sliding window evaluated against two
+// different "now"s admits a different number of requests depending on which
+// replica a request happened to land on, and every local test would still pass.
+// Two gateways on one host cannot demonstrate drift, so the guarantee is pinned
+// here, at the one place a caller's clock could ever get in.
+func (c *Checker) callArgs(req limiter.Request, cost int64) ([]string, []any, error) {
 	peek := 0
 	if req.PeekOnly {
 		peek = 1
@@ -124,16 +147,16 @@ func (c *Checker) Check(ctx context.Context, req limiter.Request) (limiter.Resul
 		case limiter.AlgorithmSlidingWindow:
 			argv = append(argv, "sw", micros(l.Period), l.Count, l.Count)
 		default:
-			return limiter.Result{}, fmt.Errorf("redis: unknown algorithm %q", l.Algorithm)
+			return nil, nil, fmt.Errorf("redis: unknown algorithm %q", l.Algorithm)
 		}
 	}
-
-	raw, err := c.script.Run(ctx, c.client, keys, argv...).Result()
-	if err != nil {
-		return limiter.Result{}, fmt.Errorf("redis: check: %w", err)
-	}
-	return parseResult(raw, req)
+	return keys, argv, nil
 }
+
+// clockArgIndex is where the clock override sits in ARGV, counting from zero.
+// The tests name it rather than the literal, so a reordering of the prefix
+// moves the assertion with it.
+const clockArgIndex = 4
 
 func micros(d time.Duration) int64 { return int64(d / time.Microsecond) }
 

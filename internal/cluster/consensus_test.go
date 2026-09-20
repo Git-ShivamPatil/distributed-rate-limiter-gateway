@@ -629,3 +629,105 @@ func TestTheRingKeepsAdmittingWhileTheLeaderIsLost(t *testing.T) {
 		}
 	}
 }
+
+// A node that restarts over its own log recovers what it committed, and does
+// NOT bootstrap a second time.
+//
+// Every other test in this file runs on in-memory stores, which means
+// raft.HasExistingState is always false and the branch that guards
+// re-bootstrapping is never taken. That branch is the one standing between a
+// rolling restart and a node deciding it is a brand new cluster, so it needs a
+// test that actually writes a log to disk.
+//
+// Mutation to check this against: delete `!existing &&` from StartConsensus and
+// this test fails, because raft refuses to bootstrap a store that already has
+// state.
+func TestANodeRestartsOverItsOwnLogWithoutBootstrappingAgain(t *testing.T) {
+	dir := t.TempDir()
+	peer := Peer{ID: "gateway-1", Addr: "127.0.0.1:19101", RaftAddr: "127.0.0.1:19201"}
+
+	start := func() *Consensus {
+		t.Helper()
+		// A fresh transport each time: the old one belongs to the process that
+		// just stopped, which is the point of a restart.
+		_, trans := raft.NewInmemTransport(raft.ServerAddress(peer.RaftAddr))
+		c, err := StartConsensus(ConsensusOptions{
+			NodeID:             peer.ID,
+			Peers:              []Peer{peer},
+			VNodes:             128,
+			Dir:                dir,
+			Transport:          trans,
+			HeartbeatTimeout:   200 * time.Millisecond,
+			ElectionTimeout:    200 * time.Millisecond,
+			LeaderLeaseTimeout: 100 * time.Millisecond,
+			CommitTimeout:      10 * time.Millisecond,
+			RaftLogger:         hclog.NewNullLogger(),
+		})
+		if err != nil {
+			t.Fatalf("starting over %s: %v", dir, err)
+		}
+		return c
+	}
+
+	waitLeader := func(c *Consensus) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := c.WaitForLeader(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first := start()
+	waitLeader(first)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	if err := first.Seed(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Propose(ctx, Command{Kind: SetStoreGen, Gen: 17}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Propose(ctx, Command{Kind: BumpPolicyGen}); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	before, err := first.State().Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The log is on disk now. Coming back up must read it rather than decide
+	// this is a new cluster.
+	second := start()
+	t.Cleanup(func() { _ = second.Close() })
+	waitLeader(second)
+
+	after, err := second.State().Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("a restart did not recover what was committed:\n before %s\n after  %s", before, after)
+	}
+	if got := second.State().StoreGen; got != 17 {
+		t.Fatalf("the store generation came back as %d, want 17", got)
+	}
+	if got := second.State().PolicyGen; got != 1 {
+		t.Fatalf("the policy generation came back as %d, want 1", got)
+	}
+
+	// And seeding again is still a no-op, because the log already has members.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel2()
+	if err := second.Seed(ctx2); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := second.State().Encode(); string(again) != string(before) {
+		t.Fatal("seeding after a restart changed the committed state")
+	}
+}
