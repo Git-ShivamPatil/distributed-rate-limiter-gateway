@@ -95,25 +95,38 @@ func policyToDTO(rec policy.PolicyRecord) policyDTO {
 // write and lose it.
 func (s *Server) mountAdmin(r chi.Router) {
 	r.Route("/admin/v1", func(r chi.Router) {
-		r.Use(s.requireAdmin)
+		// Two groups, because the two halves of the admin API need different
+		// things to exist. Editing a tenant needs a writable policy store;
+		// changing the membership needs a replicated log and no database at
+		// all, and a gateway that has one but not the other should serve the
+		// half it can rather than neither.
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireAdmin)
 
-		r.Get("/tenants", s.adminListTenants)
-		r.Post("/tenants", s.adminUpsertTenant)
-		r.Put("/tenants/{id}", s.adminUpsertTenant)
-		r.Delete("/tenants/{id}", s.adminDeleteTenant)
-		r.Post("/tenants/{id}/keys", s.adminCreateKey)
-		r.Delete("/tenants/{id}/keys/{prefix}", s.adminRevokeKey)
+			r.Get("/tenants", s.adminListTenants)
+			r.Post("/tenants", s.adminUpsertTenant)
+			r.Put("/tenants/{id}", s.adminUpsertTenant)
+			r.Delete("/tenants/{id}", s.adminDeleteTenant)
+			r.Post("/tenants/{id}/keys", s.adminCreateKey)
+			r.Delete("/tenants/{id}/keys/{prefix}", s.adminRevokeKey)
 
-		r.Get("/policies", s.adminListPolicies)
-		r.Put("/policies/{name}", s.adminUpsertPolicy)
+			r.Get("/policies", s.adminListPolicies)
+			r.Put("/policies/{name}", s.adminUpsertPolicy)
+		})
+
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireAdminToken)
+			r.Route("/cluster", s.mountClusterAdmin)
+		})
 	})
 }
 
-func (s *Server) requireAdmin(next http.Handler) http.Handler {
+// requireAdminToken is the credential check alone.
+func (s *Server) requireAdminToken(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.admin == nil || s.adminToken == nil || !s.adminToken.Configured() {
+		if s.adminToken == nil || !s.adminToken.Configured() {
 			writeError(w, http.StatusNotImplemented, "admin_disabled",
-				"the admin API needs a writable policy store (policy.store: postgres) and an admin token")
+				"the admin API needs an admin token; nothing is served without one")
 			return
 		}
 		if err := s.adminToken.Check(r); err != nil {
@@ -126,6 +139,18 @@ func (s *Server) requireAdmin(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// requireAdmin is the credential check plus a store to write to.
+func (s *Server) requireAdmin(next http.Handler) http.Handler {
+	return s.requireAdminToken(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.admin == nil {
+			writeError(w, http.StatusNotImplemented, "admin_disabled",
+				"the admin API needs a writable policy store (policy.store: postgres)")
+			return
+		}
+		next.ServeHTTP(w, r)
+	}))
 }
 
 // invalidate drops the tenant from this node's cache so an edit takes effect

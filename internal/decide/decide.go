@@ -168,6 +168,10 @@ func (s *Service) Decide(ctx context.Context, q Query) (Outcome, error) {
 	if q.Tenant == "" {
 		return Outcome{}, ErrNoTenant
 	}
+	// Nothing in a production build; see fault_off.go.
+	if err := s.faultHook(ctx); err != nil {
+		return Outcome{}, fmt.Errorf("%w: %v", ErrStoreUnavailable, err)
+	}
 
 	if out, handled, err := s.maybeForward(ctx, q); handled {
 		return out, err

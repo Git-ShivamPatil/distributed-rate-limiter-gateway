@@ -53,6 +53,38 @@ type Cluster struct {
 	ForwardTimeout time.Duration `yaml:"forward_timeout"`
 	// ForwardPoolSize is how many connections are held per peer.
 	ForwardPoolSize int `yaml:"forward_pool_size"`
+	// Raft replaces the member list above as the source of membership. With
+	// it off, this file is the truth and a node that dies leaves a stale
+	// entry behind; with it on, the file is only the bootstrap seed.
+	Raft Raft `yaml:"raft"`
+}
+
+// Raft governs membership and ring configuration, and nothing else.
+//
+// No counter and no admission decision passes through it. That is the whole
+// point of the design: correctness lives in Redis behind an atomic script, so
+// consensus never has to be on the request path, where one to three
+// fsync-bounded round trips per check would not be a latency regression but an
+// impossibility.
+type Raft struct {
+	// Enabled turns the log on. Off, the gateway behaves exactly as it did
+	// before: membership comes from the member list and never changes while
+	// the process runs.
+	Enabled bool `yaml:"enabled"`
+	// Dir holds the log and its snapshots. Empty keeps both in memory, which
+	// loses the log on restart -- fine for a test, wrong for a deployment,
+	// and so it is reported at startup rather than assumed.
+	Dir string `yaml:"dir"`
+	// Advertise overrides the address peers are told to reach this node on,
+	// for a container that binds 0.0.0.0 and is reached on something else.
+	Advertise string `yaml:"advertise"`
+	// The election timers. Zero takes hashicorp/raft's defaults, which are
+	// tuned for a datacenter; a local cluster of three processes on two cores
+	// wants them shorter.
+	HeartbeatTimeout   time.Duration `yaml:"heartbeat_timeout"`
+	ElectionTimeout    time.Duration `yaml:"election_timeout"`
+	LeaderLeaseTimeout time.Duration `yaml:"leader_lease_timeout"`
+	CommitTimeout      time.Duration `yaml:"commit_timeout"`
 }
 
 // Member is one node of the ring.
@@ -62,6 +94,11 @@ type Member struct {
 	ID string `yaml:"id"`
 	// Addr is this member's gRPC address, which is where forwards go.
 	Addr string `yaml:"addr"`
+	// RaftAddr is where this member's consensus traffic goes. It is separate
+	// from Addr because the two carry different traffic and fail differently:
+	// putting a leader election and a tenant's checks in one queue means a
+	// burst of either delays the other.
+	RaftAddr string `yaml:"raft_addr"`
 }
 
 // Route sends matching requests to an upstream, after the limiter has decided.
@@ -359,7 +396,10 @@ func (c Config) Validate() error {
 // validateCluster rejects a ring this node could not take part in.
 func (c Config) validateCluster() error {
 	if len(c.Cluster.Members) == 0 {
-		return nil // alone, which is a valid deployment
+		// Alone, which is a valid deployment -- but consensus still has to be
+		// checked, because "raft on, nobody to reach it with" is exactly the
+		// configuration that would otherwise slip through here.
+		return c.validateRaft()
 	}
 	seenID := map[string]bool{}
 	seenAddr := map[string]bool{}
@@ -393,6 +433,38 @@ func (c Config) validateCluster() error {
 	}
 	if c.Cluster.ForwardTimeout < 0 {
 		return fmt.Errorf("cluster: forward_timeout must not be negative")
+	}
+	return c.validateRaft()
+}
+
+// validateRaft rejects a consensus configuration this node could not join.
+func (c Config) validateRaft() error {
+	r := c.Cluster.Raft
+	if !r.Enabled {
+		return nil
+	}
+	if len(c.Cluster.Members) == 0 {
+		return fmt.Errorf("cluster: raft.enabled with no members; consensus needs the peers it is forming a cluster with")
+	}
+	if r.HeartbeatTimeout < 0 || r.ElectionTimeout < 0 || r.LeaderLeaseTimeout < 0 || r.CommitTimeout < 0 {
+		return fmt.Errorf("cluster: the raft timeouts must not be negative")
+	}
+
+	seen := make(map[string]string, len(c.Cluster.Members)*2)
+	for _, m := range c.Cluster.Members {
+		seen[m.Addr] = m.ID + " (requests)"
+	}
+	for _, m := range c.Cluster.Members {
+		if m.RaftAddr == "" {
+			// Falling back to the request address would have consensus try to
+			// bind the port gRPC is already listening on: the node would fail
+			// to start, and the reason would be two configuration lines apart.
+			return fmt.Errorf("cluster: member %q has no raft_addr, and consensus cannot share the request port %s", m.ID, m.Addr)
+		}
+		if owner, taken := seen[m.RaftAddr]; taken {
+			return fmt.Errorf("cluster: member %q wants %s for consensus, which %s already uses", m.ID, m.RaftAddr, owner)
+		}
+		seen[m.RaftAddr] = m.ID + " (consensus)"
 	}
 	return nil
 }

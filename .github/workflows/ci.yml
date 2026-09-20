@@ -43,6 +43,28 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
+      # The fault-injection build is how every "this mechanism is load-bearing"
+      # claim gets its control, so it has to keep compiling even though nothing
+      # ships it.
+      - name: the fault-injection build still compiles
+        run: go build -tags faultinject ./... && go vet -tags faultinject ./...
+      # A fault-injection seam that shipped would be a quota-bypass primitive.
+      # The faults live behind a build tag, and this is the assertion that they
+      # stayed there -- with its own control, because a check for an absent
+      # symbol passes just as happily when the symbol was renamed.
+      - name: no fault-injection seam in a production binary
+        run: |
+          go build -o /tmp/gateway-prod ./cmd/gateway
+          go build -tags faultinject -o /tmp/gateway-fault ./cmd/gateway
+          if go tool nm /tmp/gateway-prod | grep -q 'decide.FaultPreCheck'; then
+            echo "the production binary carries a fault-injection hook"
+            exit 1
+          fi
+          if ! go tool nm /tmp/gateway-fault | grep -q 'decide.FaultPreCheck'; then
+            echo "the fault-injection binary does not carry the hook either,"
+            echo "so the check above proves nothing -- it was renamed or removed"
+            exit 1
+          fi
 
   proto:
     name: Generated code is current
@@ -245,6 +267,47 @@ jobs:
       # the ring is doing anything).
       - name: cluster quota
         run: ./scripts/cluster-quota-test.sh
+
+  leader-kill:
+    name: Killing the leader is an election, not an outage
+    runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: gateway
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gateway"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # Three nodes, continuous traffic, SIGKILL the leader mid-flight: a new
+      # leader takes over and the quota still comes out exactly.
+      - name: leader kill
+        run: ./scripts/kill-leader.sh
+      # The control. Claim 2 of that script would hold with no consensus in the
+      # system at all, so the same scenario runs against a build that puts
+      # consensus ON the request path, where it is REQUIRED to break. Without
+      # this half, the run above says nothing about the design decision.
+      - name: the same scenario with consensus on the request path, which must break
+        run: ./scripts/kill-leader.sh --control
 
   case-study:
     name: The commands the case study publishes

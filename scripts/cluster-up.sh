@@ -20,6 +20,11 @@ cd "$(dirname "$0")/.." || exit 1
 NODES="${1:-3}"
 BASE_HTTP="${BASE_HTTP:-18100}"
 BASE_GRPC="${BASE_GRPC:-19100}"
+BASE_RAFT="${BASE_RAFT:-19200}"
+# Consensus governs membership and ring configuration. RAFT=0 falls back to the
+# member list below being the membership for the life of the process, which is
+# what this script did before there was a log to commit it to.
+RAFT="${RAFT:-1}"
 REDIS="${REDIS_ADDR:-127.0.0.1:6379}"
 DSN="${POSTGRES_DSN:-postgres://gateway:gateway@127.0.0.1:5432/gateway?sslmode=disable}"
 ADMIN_TOKEN="${GATEWAY_ADMIN_TOKEN:-cluster-admin-token}"
@@ -42,7 +47,10 @@ mkdir -p "${DIR}"
 BIN="${DIR}/gateway"
 
 echo "=== build ==="
-go build -o "${BIN}" ./cmd/gateway || exit 1
+# BUILD_TAGS is how a control run asks for a deliberately broken binary. It is
+# never set by anything that is proving something works.
+# shellcheck disable=SC2086
+go build ${BUILD_TAGS:+-tags ${BUILD_TAGS}} -o "${BIN}" ./cmd/gateway || exit 1
 go build -o "${DIR}/gatewayctl" ./cmd/gatewayctl || exit 1
 
 echo "=== migrate ==="
@@ -53,11 +61,15 @@ members=""
 for i in $(seq 1 "${NODES}"); do
   members="${members}    - id: gateway-${i}
       addr: \"127.0.0.1:$((BASE_GRPC + i))\"
+      raft_addr: \"127.0.0.1:$((BASE_RAFT + i))\"
 "
 done
 
 : >"${DIR}/nodes"
 : >"${DIR}/pids"
+
+raft_enabled=false
+[ "${RAFT}" = "1" ] && raft_enabled=true
 
 for i in $(seq 1 "${NODES}"); do
   http=$((BASE_HTTP + i))
@@ -91,6 +103,17 @@ check_api:
 cluster:
   vnodes: 256
   forward_timeout: 3s
+  raft:
+    enabled: ${raft_enabled}
+    dir: "${PWD}/${DIR}/raft-gateway-${i}"
+    # A development box runs every node, Redis, Postgres and the load on two
+    # cores. The datacentre defaults (1s heartbeat) would have a node lose
+    # leadership to its own scheduler; these are short enough to elect quickly
+    # and long enough to survive a busy runner.
+    heartbeat_timeout: 500ms
+    election_timeout: 500ms
+    leader_lease_timeout: 250ms
+    commit_timeout: 50ms
   members:
 ${members}
 YAML
@@ -119,6 +142,29 @@ done <"${DIR}/nodes"
 if [ "${failed}" -ne 0 ]; then
   ./scripts/cluster-down.sh >/dev/null 2>&1
   exit 1
+fi
+
+# A node serves as soon as it is healthy, on the ring its configuration file
+# gave it -- it does not wait for an election, because it has nothing to wait
+# for. But a test that is about to kill the leader needs one to exist, so this
+# waits for the cluster to agree on a leader before saying it is up.
+if [ "${RAFT}" = "1" ]; then
+  leader=""
+  first_http=$(head -1 "${DIR}/nodes" | awk '{print $2}')
+  for _ in $(seq 1 150); do
+    leader=$(curl -fsS --max-time 1 "http://127.0.0.1:${first_http}/v1/cluster" 2>/dev/null |
+      sed -n 's/.*"leader_id":"\([^"]*\)".*/\1/p')
+    [ -n "${leader}" ] && break
+    sleep 0.2
+  done
+  if [ -z "${leader}" ]; then
+    echo "FAIL: no leader was elected within 30s" >&2
+    tail -20 "${DIR}"/gateway-*.log >&2
+    ./scripts/cluster-down.sh >/dev/null 2>&1
+    exit 1
+  fi
+  echo
+  echo "raft leader: ${leader}"
 fi
 
 echo

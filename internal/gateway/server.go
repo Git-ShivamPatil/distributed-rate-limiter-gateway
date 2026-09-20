@@ -48,6 +48,8 @@ type Server struct {
 	admin      AdminStore
 	adminToken *auth.AdminToken
 	cache      *policy.Cache
+	consensus  func() cluster.Stats
+	control    ClusterController
 }
 
 // Option configures a Server.
@@ -61,6 +63,24 @@ func WithProxy(p *Proxy) Option { return func(s *Server) { s.proxy = p } }
 
 // WithCluster supplies the ring view that /v1/cluster reports.
 func WithCluster(v *cluster.View) Option { return func(s *Server) { s.cluster = v } }
+
+// WithConsensus makes /v1/cluster report where this node sits in the log:
+// which node is leading, and how far behind this one is.
+//
+// It is reported on the same endpoint as the ring on purpose. When a node is
+// routing a tenant somewhere unexpected, the two questions are always asked
+// together -- what does this node think the membership is, and is it caught up
+// enough for that to mean anything.
+func WithConsensus(stats func() cluster.Stats) Option {
+	return func(s *Server) { s.consensus = stats }
+}
+
+// WithClusterControl enables the membership endpoints, which are the only
+// part of the admin API that appends to the replicated log rather than writing
+// a row.
+func WithClusterControl(c ClusterController) Option {
+	return func(s *Server) { s.control = c }
+}
 
 // WithAdmin enables the management API over a writable store, behind a token.
 func WithAdmin(store AdminStore, token *auth.AdminToken) Option {
@@ -173,6 +193,9 @@ func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 			body["owner_addr"] = owner.Addr
 			body["owner_is_self"] = isSelf
 		}
+	}
+	if s.consensus != nil {
+		body["raft"] = s.consensus()
 	}
 	if s.decider != nil {
 		st := s.decider.Stats()

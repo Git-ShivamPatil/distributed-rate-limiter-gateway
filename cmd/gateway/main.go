@@ -52,6 +52,7 @@ type options struct {
 	node       string
 	httpAddr   string
 	grpcAddr   string
+	raftAddr   string
 	logLevel   string
 	logFormat  string
 }
@@ -63,6 +64,7 @@ func parseFlags(args []string) (options, error) {
 	fs.StringVar(&o.node, "node", "", "node id; overrides node.id from the config")
 	fs.StringVar(&o.httpAddr, "http-addr", "", "HTTP listen address; overrides node.http_addr")
 	fs.StringVar(&o.grpcAddr, "grpc-addr", "", "gRPC listen address; overrides node.grpc_addr")
+	fs.StringVar(&o.raftAddr, "raft-addr", "", "consensus listen address; overrides this node's cluster.members entry")
 	fs.StringVar(&o.logLevel, "log-level", "info", "debug, info, warn or error")
 	fs.StringVar(&o.logFormat, "log-format", "text", "text or json")
 	fs.Usage = func() {
@@ -106,6 +108,21 @@ func run(args []string) error {
 	}
 	if opts.grpcAddr != "" {
 		cfg.Node.GRPCAddr = opts.grpcAddr
+	}
+	if opts.raftAddr != "" {
+		// Two nodes on one host need two of every port, and consensus is a
+		// third one. The flag edits this node's own entry so that the member
+		// list the nodes share stays identical -- they must all compute the
+		// same ring from the same ids.
+		found := false
+		for i := range cfg.Cluster.Members {
+			if cfg.Cluster.Members[i].ID == cfg.Node.ID {
+				cfg.Cluster.Members[i].RaftAddr, found = opts.raftAddr, true
+			}
+		}
+		if !found {
+			return fmt.Errorf("--raft-addr was given but %q is not in cluster.members", cfg.Node.ID)
+		}
 	}
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -184,6 +201,15 @@ func run(args []string) error {
 		defer func() { _ = forwarder.Close() }()
 	}
 
+	consensus, err := startConsensus(ctx, cfg, view, log)
+	if err != nil {
+		return err
+	}
+	if consensus != nil {
+		defer func() { _ = consensus.Close() }()
+	}
+	installFaults(consensus, log)
+
 	decider := decide.New(checker, policies, cfg.Node.ID, decideOpts...)
 
 	serverOpts := []gateway.Option{
@@ -198,6 +224,11 @@ func run(args []string) error {
 	}
 	if view != nil {
 		serverOpts = append(serverOpts, gateway.WithCluster(view))
+	}
+	if consensus != nil {
+		serverOpts = append(serverOpts,
+			gateway.WithConsensus(consensus.Stats),
+			gateway.WithClusterControl(consensus))
 	}
 	if len(cfg.Routes) > 0 {
 		proxy, err := gateway.NewProxy(cfg.Routes, log)
@@ -286,6 +317,120 @@ func buildRing(cfg config.Config, log *slog.Logger) (*cluster.View, *forward.Cli
 		"members", len(members), "vnodes", view.Ring().VNodes(),
 		"epoch", view.Epoch(), "own_points", dist[cfg.Node.ID])
 	return view, fwd, nil
+}
+
+// startConsensus brings this node into the replicated log, if the file asks
+// for it.
+//
+// What the log governs is membership, ring configuration and three
+// generations -- never a counter and never an admission. With it off, the
+// member list in the file is the membership for the life of the process,
+// which is what every milestone before this one did; with it on, the file is
+// the seed and the log is the truth.
+//
+// It returns nil, nil when consensus is not configured. A gateway with no
+// ring has nothing to reach agreement about.
+func startConsensus(ctx context.Context, cfg config.Config, view *cluster.View, log *slog.Logger) (*cluster.Consensus, error) {
+	if view == nil || !cfg.Cluster.Raft.Enabled {
+		return nil, nil
+	}
+
+	peers := make([]cluster.Peer, 0, len(cfg.Cluster.Members))
+	for _, m := range cfg.Cluster.Members {
+		peers = append(peers, cluster.Peer{ID: m.ID, Addr: m.Addr, RaftAddr: m.RaftAddr})
+	}
+
+	rc := cfg.Cluster.Raft
+	c, err := cluster.StartConsensus(cluster.ConsensusOptions{
+		NodeID:             cfg.Node.ID,
+		Peers:              peers,
+		VNodes:             cfg.Cluster.VNodes,
+		Dir:                rc.Dir,
+		Advertise:          rc.Advertise,
+		HeartbeatTimeout:   rc.HeartbeatTimeout,
+		ElectionTimeout:    rc.ElectionTimeout,
+		LeaderLeaseTimeout: rc.LeaderLeaseTimeout,
+		CommitTimeout:      rc.CommitTimeout,
+		Logger:             log,
+		OnApply: func(s cluster.State) {
+			if err := view.Adopt(s); err != nil {
+				// The committed membership does not include this node. It
+				// keeps answering on the ring it had rather than adopting one
+				// that would have it forward every request away, including
+				// its own tenants -- which is what a shard being drained
+				// should do until it is actually stopped.
+				log.Warn("the committed membership does not include this node; still answering on the previous ring",
+					"epoch", s.RingEpoch, "err", err)
+				return
+			}
+			log.Info("ring updated from the log",
+				"epoch", s.RingEpoch, "members", len(s.Members), "vnodes", s.VNodes)
+			// The log is the truth, and a file that disagrees with it is a
+			// question worth asking out loud: somebody edited the member list
+			// and restarted expecting it to take effect, and it did not.
+			if extra := membersNotIn(cfg.Cluster.Members, s); len(extra) > 0 {
+				log.Warn("the configuration names shards the cluster has not committed; the log is the membership, not this file",
+					"only_in_config", extra)
+			}
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if rc.Dir == "" {
+		log.Warn("raft.dir is empty, so the log is in memory: this node forgets the cluster when it restarts")
+	}
+	log.Info("consensus started",
+		"node", cfg.Node.ID, "peers", len(peers), "dir", rc.Dir)
+
+	// Seeding waits for this node to win an election rather than blocking
+	// startup on one. A gateway that refused to serve until a leader existed
+	// would turn a slow election into an outage, and it has nothing to wait
+	// for: it is already enforcing, against the ring the file gave it.
+	go seedRing(ctx, c, log)
+	return c, nil
+}
+
+// membersNotIn reports which configured shards the committed state does not
+// have, which is the only direction worth warning about: a shard the log has
+// and the file does not is an addition made through the admin API, and that is
+// the system working.
+func membersNotIn(configured []config.Member, s cluster.State) []string {
+	var out []string
+	for _, m := range configured {
+		if !s.Has(m.ID) {
+			out = append(out, m.ID)
+		}
+	}
+	return out
+}
+
+// seedRing commits the configured membership the first time this node leads.
+//
+// It is a no-op against a state that already has members, so a restart, a
+// re-election and a second leader all reach the same place: the configuration
+// file seeds an empty cluster once, and after that the log is the truth.
+func seedRing(ctx context.Context, c *cluster.Consensus, log *slog.Logger) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case leading, ok := <-c.LeaderCh():
+			if !ok {
+				return
+			}
+			if !leading {
+				continue
+			}
+			seedCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := c.Seed(seedCtx)
+			cancel()
+			if err != nil {
+				log.Warn("could not seed the ring from the configuration", "err", err)
+			}
+		}
+	}
 }
 
 // serveGRPC starts the Limiter service and returns a function that stops it.

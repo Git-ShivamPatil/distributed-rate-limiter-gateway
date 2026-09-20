@@ -41,9 +41,9 @@ type Node struct {
 	// ID is stable across restarts and is what the ring hashes. An address can
 	// change -- a pod is rescheduled, a port is remapped -- without moving a
 	// single tenant, which is the entire reason ownership is keyed by id.
-	ID string
+	ID string `json:"id"`
 	// Addr is where peers reach this node's gRPC service.
-	Addr string
+	Addr string `json:"addr"`
 }
 
 // Ring maps a key to the node that owns it.

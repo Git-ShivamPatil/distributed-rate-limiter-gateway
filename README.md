@@ -53,6 +53,7 @@ limiter that silently stops limiting is worse than one that will not boot.
 | `:9090` | `Check`, `GetQuota` and a decision stream; reflection is on |
 | `GET /v1/cluster` | this node's view of the ring, and who owns a given tenant |
 | `/admin/v1/...` | tenants, policies and API keys, behind an admin token |
+| `/admin/v1/cluster/members` | the committed membership, and the two calls that change it |
 | `gatewayctl` | `migrate up`, `apikey create`, `counters reset` |
 
 **Two algorithms.** A token bucket, stored as GCRA — one timestamp rather than a
@@ -144,6 +145,67 @@ removed), and that forwarding **actually happened** (which is the only thing
 that shows the ring is doing anything). The answer names the owner and says it
 was forwarded; the nodes' own counters have to agree.
 
+### Membership, under consensus
+
+```bash
+scripts/cluster-up.sh 3        # three nodes, one ring, one Redis, one Raft cluster
+scripts/kill-leader.sh         # kill the leader mid-flight; the quota still comes out exactly
+curl -sH "X-Admin-Token: $GATEWAY_ADMIN_TOKEN" localhost:18101/admin/v1/cluster/members
+```
+
+The member list in the config file is the **seed**, not the truth. Once a
+membership has committed, the log is the truth and the file is never consulted
+again -- otherwise a node that came back holding a stale file would put back a
+shard the cluster had removed.
+
+**Nobody is told to join.** The node whose id sorts first creates the cluster
+with every configured peer already a voter; the rest start with an empty log
+and learn the configuration from the leader. Every node computes the same
+answer from the same list, so there is no flag an operator can set on two nodes
+and end up with two clusters -- and a node that already has a log never
+bootstraps again, whatever the file says.
+
+**The initial ring arrives as one entry**, not as one entry per member. Seeding
+a member at a time would have every node build a ring out of however much had
+arrived so far -- a one-member ring, then a two-member ring, each of them a
+real ring that really routes -- and the vnode count would land after the
+members, so the ring would be built at the default width and then rebuilt at
+the configured one, moving nearly every tenant. That was a real bug, caught by
+the test that asserts an election moves nothing.
+
+**The epoch advances only when a tenant could have moved.** Adding or removing
+a shard advances it; changing a member's *address* does not, because the ring
+hashes ids and a member that moved host owns exactly what it owned before.
+Advancing a fencing token for a change that fences nothing is how a rolling
+deploy becomes a takeover storm.
+
+**Losing the leader is an election, not an outage.** `scripts/kill-leader.sh`
+runs continuous traffic against three nodes, `SIGKILL`s the leader at a fixed
+request number -- a deterministic trigger, never a timer -- and requires every
+request to a surviving node to be answered with a decision, and the total
+admitted to equal the quota *exactly*. The election time is **reported and
+asserted on by nothing**: how long raft takes to notice a dead leader is a
+property of its timers and of the machine.
+
+**What proves that matters** is the control, because the quota assertion would
+also hold in a cluster with no consensus at all. The same scenario runs against
+a build made with `-tags faultinject` that puts consensus **on** the request
+path, where killing the leader is **required** to break traffic -- and it does:
+78 of 100 requests answer with neither a decision nor a refusal. That is the
+difference between "consensus is off the request path" and "consensus happened
+to be fast today". CI also asserts the fault seam is absent from a production
+binary *and present in the fault build*, so the check cannot pass by having
+been renamed.
+
+**What consensus deliberately does not do is notice a dead node.** There is no
+failure detector anywhere in this design. A shard that dies does not leave the
+ring by itself; something has to commit the removal through
+`/admin/v1/cluster/members`. That is safe rather than convenient: losing a
+shard was already a latency event and not a capacity gap, because a failed
+forward is decided locally against the same Redis and counted. Membership
+changes are graceful and commanded, and the README would rather say so than
+imply a liveness mechanism that is not there.
+
 ## Architecture
 
 ```mermaid
@@ -163,7 +225,7 @@ flowchart LR
 |---|---|---|
 | **Client traffic** | `in` | REST / gRPC |
 | **Gateway replicas** | `work` | auth · routing · policy · proxy |
-| **Limiter shard ring** | `work` | consistent hashing with virtual nodes · Raft over membership |
+| **Limiter shard ring** | `work` | consistent hashing with virtual nodes · Raft-committed membership |
 | **Redis + Postgres** | `state` | atomic Lua counters · tenant policies |
 | **Grafana + React** | `out` | RED metrics · live per-tenant headroom |
 
@@ -186,7 +248,7 @@ Raft governs **membership and ring ownership only**, never per-request counters 
 - [x] **M3 · Postgres policy store, tenant auth, hot-reloading cache** — per-tenant and per-endpoint policies in Postgres, served from an in-process cache; `make migrate` works as advertised.
 - [x] **M4 · gRPC contract and the actual gateway data path** — authenticates, routes, applies policy and proxies upstream; same decisions over gRPC.
 - [x] **M5 · Consistent-hash ring with cross-node forwarding** — a tenant always lands on the same shard; a node that does not own it forwards over gRPC.
-- [ ] **M6 · Raft membership and leader election** — ring ownership survives a node dying; enforcement continues with quota accuracy across the rebalance.
+- [ ] **M6 · Raft membership and leader election** — *in progress.* Membership and ring configuration are committed through Raft, and killing the leader under load is an election rather than an outage, with a control that breaks when consensus is moved onto the request path. Still owed: the policy-generation and store-generation fences inside the Lua script.
 - [ ] **M7 · Prometheus, Grafana, live React dashboard** — every decision observable; per-tenant headroom exactly as advertised.
 - [ ] **M8 · Benchmark harness and honest tuning** — a defensible throughput and p99 on real hardware, methodology written down, or the claim corrected.
 - [ ] **M9 · Kubernetes deployment and chaos under load** — the whole stack on a cluster, surviving a pod deletion mid-load.
