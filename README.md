@@ -51,7 +51,7 @@ limiter that silently stops limiting is worse than one that will not boot.
 | `GET /healthz` `/readyz` | is this process up, and can it still reach its stores |
 | `GET /api/...` | the data path: authenticate, limit, then proxy to the upstream |
 | `:9090` | `Check`, `GetQuota` and a decision stream; reflection is on |
-| `GET /v1/cluster` | this node's view of the ring, and who owns a given tenant |
+| `GET /v1/cluster` | this node's view of the ring, who owns a given tenant, where it sits in the log, and whether it is refusing everything because the counter store changed |
 | `/admin/v1/...` | tenants, policies and API keys, behind an admin token |
 | `/admin/v1/cluster/members` | the committed membership, and the two calls that change it |
 | `gatewayctl` | `migrate up`, `apikey create`, `counters reset` |
