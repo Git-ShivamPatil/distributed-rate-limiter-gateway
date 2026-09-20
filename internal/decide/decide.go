@@ -131,8 +131,9 @@ type Service struct {
 	clock    func() time.Time
 	log      *slog.Logger
 
-	cluster   ClusterView
-	forwarder Forwarder
+	cluster    ClusterView
+	forwarder  Forwarder
+	storeGenOf func() uint64
 
 	local       atomic.Int64
 	forwarded   atomic.Int64
@@ -149,6 +150,12 @@ func WithHub(h *events.Hub) Option { return func(s *Service) { s.hub = h } }
 
 // WithClock replaces the timestamp source on published decisions.
 func WithClock(fn func() time.Time) Option { return func(s *Service) { s.clock = fn } }
+
+// WithStoreGeneration supplies which lifetime of the counter store this node
+// believes it is talking to. Without it, checks are unfenced against the store.
+func WithStoreGeneration(fn func() uint64) Option {
+	return func(s *Service) { s.storeGenOf = fn }
+}
 
 // WithLogger sets where fallbacks are reported.
 func WithLogger(l *slog.Logger) Option { return func(s *Service) { s.log = l } }
@@ -180,6 +187,13 @@ func (s *Service) Stats() Stats {
 		PolicyStale: s.policyStale.Load(),
 		StoreFenced: s.storeFenced.Load(),
 	}
+}
+
+func (s *Service) storeGen() uint64 {
+	if s.storeGenOf == nil {
+		return 0
+	}
+	return s.storeGenOf()
 }
 
 // Node reports which node this is, which every answer carries.
@@ -228,6 +242,12 @@ func (s *Service) decideHere(ctx context.Context, q Query, refreshed bool) (Outc
 		Limits:   limits,
 		Cost:     q.Cost,
 		PeekOnly: q.Peek,
+		// The generations this node is carrying. They are compared inside the
+		// store, not here: a node that checked its own vintage would be
+		// deciding whether it is out of date using the information that is out
+		// of date.
+		PolicyGen: pol.Gen,
+		StoreGen:  s.storeGen(),
 	})
 	if err != nil {
 		if errors.Is(err, limiter.ErrCostExceedsCapacity) {

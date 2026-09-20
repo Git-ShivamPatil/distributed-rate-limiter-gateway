@@ -88,6 +88,11 @@ type Policy struct {
 	Matches []Match
 	// FailureMode decides what happens when the counter store is unreachable.
 	FailureMode string
+	// Gen says how recent this copy is, on a counter the cluster's log mints
+	// and totally orders. It travels to the counter store with every check, so
+	// a node offering limits older than the ones already enforced is refused
+	// there rather than trusted here. Zero means unfenced.
+	Gen uint64
 }
 
 // FailsClosed reports whether an unreachable counter store should refuse.

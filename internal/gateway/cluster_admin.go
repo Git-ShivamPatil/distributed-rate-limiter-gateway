@@ -81,6 +81,54 @@ func (s *Server) adminRemoveMember(w http.ResponseWriter, r *http.Request) {
 	s.propose(w, r, cluster.Command{Kind: cluster.RemoveShard, ID: id})
 }
 
+// bumpPolicyGen mints the next policy generation, after an edit has landed.
+//
+// The ORDER is Postgres first, then the log, and the failure it leaves behind
+// is the survivable one. A crash between the two means the edit is live but
+// un-fenced: a node still holding the old limits is not refused, which is
+// exactly the behaviour this gateway had before fences existed. The other
+// order would mint a generation for an edit that never happened, fencing every
+// node until each refreshed and found nothing had changed.
+//
+// It reports whether the caller should stop, having already answered.
+func (s *Server) bumpPolicyGen(w http.ResponseWriter, r *http.Request, what string) bool {
+	if s.control == nil {
+		return false // no log; policies are unfenced, which is the single-node case
+	}
+
+	_, err := s.control.Propose(r.Context(), cluster.Command{Kind: cluster.BumpPolicyGen})
+	if err == nil {
+		return false
+	}
+
+	var notLeader *cluster.NotLeaderError
+	if errors.As(err, &notLeader) {
+		// The edit is already written. Saying so matters: an operator who
+		// reads "not leader" as "nothing happened" will not re-send, and the
+		// edit stays un-fenced indefinitely. Re-sending the same request to
+		// the leader finishes the job, because both halves are idempotent.
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":       "not_leader",
+			"message":     what + " was written, but the generation that fences it is minted by the leader; re-send this request there",
+			"leader":      notLeader.LeaderID,
+			"leader_addr": notLeader.LeaderAddr,
+			"written":     true,
+			"fenced":      false,
+		})
+		return true
+	}
+
+	s.log.Error("the edit landed but its generation did not; nodes holding the old policy will not be refused",
+		"what", what, "err", err)
+	writeJSON(w, http.StatusConflict, map[string]any{
+		"error":   "generation_not_minted",
+		"message": what + " was written, but the generation that fences it could not be committed",
+		"written": true,
+		"fenced":  false,
+	})
+	return true
+}
+
 // propose commits one entry and reports what it did.
 //
 // A node that is not the leader answers 409 and NAMES the leader rather than

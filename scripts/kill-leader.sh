@@ -61,13 +61,18 @@ GATEWAY_ADMIN_TOKEN="${ADMIN_TOKEN}" ./scripts/cluster-up.sh "${NODES}" || exit 
 first_http=$(head -1 "${DIR}/nodes" | awk '{print $2}')
 base="http://127.0.0.1:${first_http}"
 
+# The policy below is minted through the leader, so it is written there. This
+# happens BEFORE the kill; afterwards there is a different leader, which is the
+# whole point of the test.
+admin=$(./scripts/leader-http.sh) || exit 1
+
 # A quota that cannot refill during the run. At one token per 24h/60 = 24
 # minutes, nothing this loop does can be mistaken for a refill -- which is the
 # only way an exact-count assertion stays exact.
 body=$(printf '{"failure_mode":"closed","limits":[{"name":"per-day","algorithm":"token_bucket","count":%s,"period_ms":86400000,"burst":%s}]}' "${QUOTA}" "${QUOTA}")
 code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
   -H "X-Admin-Token: ${ADMIN_TOKEN}" -H 'Content-Type: application/json' \
-  -d "${body}" "${base}/admin/v1/policies/${POLICY}")
+  -d "${body}" "${admin}/admin/v1/policies/${POLICY}")
 if [ "${code}" != "200" ]; then
   echo "FAIL: creating the policy answered ${code}" >&2
   exit 1
@@ -75,7 +80,7 @@ fi
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
   -H "X-Admin-Token: ${ADMIN_TOKEN}" -H 'Content-Type: application/json' \
   -d "{\"id\":\"${TENANT}\",\"name\":\"Kill test\",\"policy\":\"${POLICY}\"}" \
-  "${base}/admin/v1/tenants")
+  "${admin}/admin/v1/tenants")
 if [ "${code}" != "200" ]; then
   echo "FAIL: creating the tenant answered ${code}" >&2
   exit 1
@@ -97,7 +102,7 @@ echo "=== the leader is ${leader} (pid ${leader_pid}) ==="
 # routing on the ring its own file gave it, and the quota would still come out
 # exactly. So check that the membership actually committed.
 committed=$(curl -fsS --max-time 5 -H "X-Admin-Token: ${ADMIN_TOKEN}" \
-  "${base}/admin/v1/cluster/members" | grep -o '"id":"gateway-[0-9]*"' | wc -l)
+  "${admin}/admin/v1/cluster/members" | grep -o '"id":"gateway-[0-9]*"' | wc -l)
 echo "the log holds ${committed} members"
 if [ "${committed}" -ne "${NODES}" ]; then
   echo "FAIL: the log holds ${committed} members, not ${NODES}." >&2

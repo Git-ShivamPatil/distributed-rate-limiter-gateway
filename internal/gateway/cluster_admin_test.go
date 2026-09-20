@@ -221,3 +221,106 @@ func TestMembershipEndpointsAreAbsentWithoutConsensus(t *testing.T) {
 		t.Fatalf("a gateway with no consensus answered %d, want 404", w.Code)
 	}
 }
+
+func policyAndClusterServer(t *testing.T, store AdminStore, control ClusterController, token string) *Server {
+	t.Helper()
+	cfg := testConfig(t)
+	policies, err := policy.NewStatic(cfg.Policies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := policy.NewCache(policies, policy.WithTTL(time.Hour))
+	return New(cfg, decide.New(limiter.NewMemory(), cache, cfg.Node.ID), nil,
+		WithCache(cache),
+		WithAdmin(store, auth.NewAdminToken(token)),
+		WithClusterControl(control))
+}
+
+func countProposals(control *fakeControl, kind cluster.CommandKind) int {
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	n := 0
+	for _, c := range control.proposed {
+		if c.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+const onePolicy = `{"failure_mode":"closed","limits":[{"name":"per-minute","algorithm":"token_bucket","count":10,"period_ms":60000}]}`
+
+// An edit that changes what limits apply mints a generation, and that is what
+// lets the counter store refuse a node still holding the old ones.
+func TestAPolicyEditMintsAGeneration(t *testing.T) {
+	control := &fakeControl{}
+	srv := policyAndClusterServer(t, &fakeAdminStore{}, control, "secret")
+
+	if w := do(t, srv, http.MethodPut, "/admin/v1/policies/free", "secret", onePolicy); w.Code != http.StatusOK {
+		t.Fatalf("writing a policy answered %d: %s", w.Code, w.Body)
+	}
+	if got := countProposals(control, cluster.BumpPolicyGen); got != 1 {
+		t.Fatalf("a policy edit minted %d generations, want exactly 1", got)
+	}
+	if got := control.State().PolicyGen; got != 1 {
+		t.Fatalf("the committed generation is %d after one edit", got)
+	}
+
+	// Moving a tenant onto a different policy is a limit change too.
+	if w := do(t, srv, http.MethodPost, "/admin/v1/tenants", "secret",
+		`{"id":"acme","name":"Acme","policy":"free"}`); w.Code != http.StatusOK {
+		t.Fatalf("writing a tenant answered %d: %s", w.Code, w.Body)
+	}
+	if got := countProposals(control, cluster.BumpPolicyGen); got != 2 {
+		t.Fatalf("a tenant edit did not mint a generation: %d total", got)
+	}
+}
+
+// The edit is written before the generation is minted, so a follower has
+// already changed the policy store by the time it discovers it cannot mint.
+// Reporting that plainly is the difference between an operator re-sending and
+// an edit staying un-fenced indefinitely.
+func TestAFollowerSaysTheEditLandedButIsNotFenced(t *testing.T) {
+	store := &fakeAdminStore{}
+	control := &fakeControl{leader: "gateway-2", leaderAt: "127.0.0.1:19202"}
+	srv := policyAndClusterServer(t, store, control, "secret")
+
+	w := do(t, srv, http.MethodPut, "/admin/v1/policies/free", "secret", onePolicy)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("a follower answered %d, want 409: %s", w.Code, w.Body)
+	}
+
+	var body struct {
+		Error   string `json:"error"`
+		Leader  string `json:"leader"`
+		Written bool   `json:"written"`
+		Fenced  bool   `json:"fenced"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error != "not_leader" || body.Leader != "gateway-2" {
+		t.Fatalf("the refusal does not name the leader: %+v", body)
+	}
+	if !body.Written {
+		t.Fatal("the answer claims the edit did not land, but it did -- an operator reading this would not re-send")
+	}
+	if body.Fenced {
+		t.Fatal("the answer claims the edit is fenced, and it is not")
+	}
+	store.mu.Lock()
+	n := len(store.policies)
+	store.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("the policy store holds %d policies; the edit should have landed before the mint was attempted", n)
+	}
+}
+
+// A gateway with no log writes policies exactly as it always did. Fencing is
+// something a cluster does; a single node has nobody to be out of step with.
+func TestWithoutALogAPolicyEditStillWorks(t *testing.T) {
+	srv := policyAndClusterServer(t, &fakeAdminStore{}, nil, "secret")
+	if w := do(t, srv, http.MethodPut, "/admin/v1/policies/free", "secret", onePolicy); w.Code != http.StatusOK {
+		t.Fatalf("writing a policy with no consensus answered %d: %s", w.Code, w.Body)
+	}
+}

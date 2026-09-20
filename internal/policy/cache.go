@@ -32,6 +32,7 @@ type Cache struct {
 	negTTL  time.Duration
 	stale   time.Duration
 	clock   func() time.Time
+	genOf   func() uint64
 	group   singleflight.Group
 	mu      sync.RWMutex
 	entries map[string]*entry
@@ -65,6 +66,16 @@ func WithNegativeTTL(d time.Duration) CacheOption { return func(c *Cache) { c.ne
 // cannot be reached. Zero disables serving stale.
 func WithStaleFor(d time.Duration) CacheOption { return func(c *Cache) { c.stale = d } }
 
+// WithGeneration supplies the policy generation the cluster has committed.
+//
+// The cache stamps it onto every entry it fetches, and the stamp is what the
+// counter store fences against. Without it a node's policies are unfenced,
+// which is the single-node case and what every test that is not about fencing
+// gets.
+func WithGeneration(fn func() uint64) CacheOption {
+	return func(c *Cache) { c.genOf = fn }
+}
+
 // WithCacheClock replaces the clock. Tests use it; production does not.
 func WithCacheClock(fn func() time.Time) CacheOption { return func(c *Cache) { c.clock = fn } }
 
@@ -76,6 +87,7 @@ func NewCache(source Source, opts ...CacheOption) *Cache {
 		negTTL:  time.Second,
 		stale:   5 * time.Minute,
 		clock:   time.Now,
+		genOf:   func() uint64 { return 0 },
 		entries: make(map[string]*entry),
 	}
 	for _, o := range opts {
@@ -107,10 +119,23 @@ func (c *Cache) Lookup(ctx context.Context, tenant string) (Policy, error) {
 			return cur, nil
 		}
 
+		// The generation is read BEFORE the fetch, and that ordering is the
+		// whole safety of the fence.
+		//
+		// A bump that commits while this query is in flight belongs to a
+		// policy this read may not have seen. Reading afterwards would stamp
+		// the NEW generation onto the OLD limits, and the store would wave
+		// them through as current -- the one mistake the fence cannot catch,
+		// because it trusts the number it is given. Reading first can only
+		// under-stamp, and an under-stamped entry is fenced, refreshed and
+		// retried. Wrong in the safe direction, every time.
+		gen := c.genOf()
+
 		p, lookupErr := c.source.Lookup(ctx, tenant)
 		if lookupErr != nil && !isAnswer(lookupErr) {
 			return nil, lookupErr // a store failure, not an answer about the tenant
 		}
+		p.Gen = gen
 		fresh := &entry{policy: p, err: lookupErr, fetchedAt: c.clock()}
 		c.mu.Lock()
 		c.entries[tenant] = fresh

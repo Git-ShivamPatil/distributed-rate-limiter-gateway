@@ -200,6 +200,11 @@ func (s *Server) adminUpsertTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.invalidate(body.ID)
+	// A tenant can be moved onto a tighter policy, so this is a limit change
+	// like any other and needs a generation of its own.
+	if s.bumpPolicyGen(w, r, "tenant "+body.ID) {
+		return
+	}
 	writeJSON(w, http.StatusOK, body)
 }
 
@@ -284,6 +289,9 @@ func (s *Server) adminUpsertPolicy(w http.ResponseWriter, r *http.Request) {
 	// A policy can be shared by many tenants, and finding which would mean
 	// querying the store at the moment it is being written to.
 	s.invalidate("")
+	if s.bumpPolicyGen(w, r, "policy "+name) {
+		return
+	}
 	writeJSON(w, http.StatusOK, policyToDTO(rec))
 }
 

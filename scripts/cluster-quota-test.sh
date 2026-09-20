@@ -37,6 +37,12 @@ GATEWAY_ADMIN_TOKEN="${ADMIN_TOKEN}" ./scripts/cluster-up.sh "${NODES}" || exit 
 first_http=$(head -1 "${DIR}/nodes" | awk '{print $2}')
 base="http://127.0.0.1:${first_http}"
 
+# Policy edits are minted through the leader, so they go there. Reading and
+# checking still happen on whichever node the test wants; this is only for the
+# writes below.
+admin=$(./scripts/leader-http.sh) || exit 1
+echo "admin writes go to the leader at ${admin}"
+
 echo
 echo "=== every node names the same owner ==="
 ./scripts/show-ownership.sh "${TENANT}" || fail=1
@@ -45,7 +51,7 @@ echo "=== every node names the same owner ==="
 body=$(printf '{"failure_mode":"closed","limits":[{"name":"per-day","algorithm":"token_bucket","count":%s,"period_ms":86400000,"burst":%s}]}' "${QUOTA}" "${QUOTA}")
 code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
   -H "X-Admin-Token: ${ADMIN_TOKEN}" -H 'Content-Type: application/json' \
-  -d "${body}" "${base}/admin/v1/policies/${POLICY}")
+  -d "${body}" "${admin}/admin/v1/policies/${POLICY}")
 if [ "${code}" != "200" ]; then
   echo "FAIL: creating the policy answered ${code}" >&2
   exit 1
@@ -53,7 +59,7 @@ fi
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
   -H "X-Admin-Token: ${ADMIN_TOKEN}" -H 'Content-Type: application/json' \
   -d "{\"id\":\"${TENANT}\",\"name\":\"Cluster\",\"policy\":\"${POLICY}\"}" \
-  "${base}/admin/v1/tenants")
+  "${admin}/admin/v1/tenants")
 if [ "${code}" != "200" ]; then
   echo "FAIL: creating the tenant answered ${code}" >&2
   exit 1

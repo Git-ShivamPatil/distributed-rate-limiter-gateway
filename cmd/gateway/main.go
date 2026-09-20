@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -131,7 +132,14 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	policies, adminStore, cache, policyReady, err := buildPolicySource(ctx, cfg, log)
+	// The two generations this node carries, published here and filled in by
+	// the log once consensus starts. They live at this level because the
+	// policy cache is built before consensus is and has to read them
+	// afterwards -- and because zero, the value they hold until then, means
+	// exactly "unfenced", which is the right answer for a node with no log.
+	var policyGen, storeGen atomic.Uint64
+
+	policies, adminStore, cache, policyReady, err := buildPolicySource(ctx, cfg, log, policyGen.Load)
 	if err != nil {
 		return err
 	}
@@ -190,7 +198,11 @@ func run(args []string) error {
 	// One decision service behind both surfaces. REST and gRPC translate; they
 	// do not decide.
 	hub := events.NewHub(events.DefaultBuffer)
-	decideOpts := []decide.Option{decide.WithHub(hub), decide.WithLogger(log)}
+	decideOpts := []decide.Option{
+		decide.WithHub(hub),
+		decide.WithLogger(log),
+		decide.WithStoreGeneration(storeGen.Load),
+	}
 
 	view, forwarder, err := buildRing(cfg, log)
 	if err != nil {
@@ -201,7 +213,7 @@ func run(args []string) error {
 		defer func() { _ = forwarder.Close() }()
 	}
 
-	consensus, err := startConsensus(ctx, cfg, view, log)
+	consensus, err := startConsensus(ctx, cfg, view, log, &policyGen, &storeGen)
 	if err != nil {
 		return err
 	}
@@ -330,7 +342,8 @@ func buildRing(cfg config.Config, log *slog.Logger) (*cluster.View, *forward.Cli
 //
 // It returns nil, nil when consensus is not configured. A gateway with no
 // ring has nothing to reach agreement about.
-func startConsensus(ctx context.Context, cfg config.Config, view *cluster.View, log *slog.Logger) (*cluster.Consensus, error) {
+func startConsensus(ctx context.Context, cfg config.Config, view *cluster.View, log *slog.Logger,
+	policyGen, storeGen *atomic.Uint64) (*cluster.Consensus, error) {
 	if view == nil || !cfg.Cluster.Raft.Enabled {
 		return nil, nil
 	}
@@ -353,6 +366,11 @@ func startConsensus(ctx context.Context, cfg config.Config, view *cluster.View, 
 		CommitTimeout:      rc.CommitTimeout,
 		Logger:             log,
 		OnApply: func(s cluster.State) {
+			// The generations first: they are what every check carries, and a
+			// membership that failed to adopt must not hold them back.
+			policyGen.Store(s.PolicyGen)
+			storeGen.Store(s.StoreGen)
+
 			if err := view.Adopt(s); err != nil {
 				// The committed membership does not include this node. It
 				// keeps answering on the ring it had rather than adopting one
@@ -491,7 +509,7 @@ func serveGRPC(cfg config.Config, decider *decide.Service, hub *events.Hub, stor
 // Returns the read side the request path uses, the write side the admin API
 // uses (nil when policies come from the config file and there is nowhere to
 // write), the cache so admin writes can invalidate it, and a readiness check.
-func buildPolicySource(ctx context.Context, cfg config.Config, log *slog.Logger) (
+func buildPolicySource(ctx context.Context, cfg config.Config, log *slog.Logger, generation func() uint64) (
 	policy.Source, gateway.AdminStore, *policy.Cache, func(context.Context) error, error,
 ) {
 	noop := func(context.Context) error { return nil }
@@ -516,6 +534,7 @@ func buildPolicySource(ctx context.Context, cfg config.Config, log *slog.Logger)
 			policy.WithTTL(cfg.Policy.CacheTTL),
 			policy.WithNegativeTTL(cfg.Policy.NegativeCacheTTL),
 			policy.WithStaleFor(cfg.Policy.StaleFor),
+			policy.WithGeneration(generation),
 		)
 
 		if cfg.Policy.ListenForChanges {
