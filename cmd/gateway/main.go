@@ -39,6 +39,7 @@ import (
 	redislimiter "github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter/redis"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/policy"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/ring"
+	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/storegen"
 )
 
 func main() {
@@ -138,6 +139,7 @@ func run(args []string) error {
 	// afterwards -- and because zero, the value they hold until then, means
 	// exactly "unfenced", which is the right answer for a node with no log.
 	var policyGen, storeGen atomic.Uint64
+	var serverGuard func() storegen.Stats
 
 	policies, adminStore, cache, policyReady, err := buildPolicySource(ctx, cfg, log, policyGen.Load)
 	if err != nil {
@@ -148,6 +150,10 @@ func run(args []string) error {
 		checker limiter.Checker
 		mem     *limiter.Memory
 		ready   func(context.Context) error
+		// The Redis checker, kept so the store guard can ask the same client
+		// what store it is talking to. Nil on the memory backend, where there
+		// is one process and nothing to disagree with.
+		store *redislimiter.Checker
 	)
 	switch cfg.Limiter.Backend {
 	case "memory":
@@ -169,6 +175,7 @@ func run(args []string) error {
 		defer func() { _ = client.Close() }()
 
 		rc := redislimiter.New(client)
+		store = rc
 		// Fail at startup rather than on the first request: a gateway that
 		// starts happily and then refuses everything because Redis was never
 		// reachable is harder to diagnose than one that will not start.
@@ -202,6 +209,7 @@ func run(args []string) error {
 		decide.WithHub(hub),
 		decide.WithLogger(log),
 		decide.WithStoreGeneration(storeGen.Load),
+		decide.WithPolicyGeneration(policyGen.Load),
 	}
 
 	view, forwarder, err := buildRing(cfg, log)
@@ -222,11 +230,19 @@ func run(args []string) error {
 	}
 	installFaults(consensus, log)
 
+	if guard := buildStoreGuard(ctx, store, consensus, log); guard != nil {
+		decideOpts = append(decideOpts, decide.WithStoreGuard(guard))
+		serverGuard = guard.Stats
+	}
+
 	decider := decide.New(checker, policies, cfg.Node.ID, decideOpts...)
 
 	serverOpts := []gateway.Option{
 		gateway.WithReadiness(ready),
 		gateway.WithAuth(authn),
+	}
+	if serverGuard != nil {
+		serverOpts = append(serverOpts, gateway.WithStoreGuard(serverGuard))
 	}
 	if cache != nil {
 		serverOpts = append(serverOpts, gateway.WithCache(cache))
@@ -241,6 +257,12 @@ func run(args []string) error {
 		serverOpts = append(serverOpts,
 			gateway.WithConsensus(consensus.Stats),
 			gateway.WithClusterControl(consensus))
+	}
+	if faultRemoved("no_policy_gen") {
+		// The control for the policy-skew scenario: with no generation minted,
+		// a node still holding the old limits has to keep enforcing them.
+		log.Warn("FAULT: policy edits mint no generation")
+		serverOpts = append(serverOpts, gateway.WithoutPolicyGenerations())
 	}
 	if len(cfg.Routes) > 0 {
 		proxy, err := gateway.NewProxy(cfg.Routes, log)
@@ -353,6 +375,12 @@ func startConsensus(ctx context.Context, cfg config.Config, view *cluster.View, 
 		peers = append(peers, cluster.Peer{ID: m.ID, Addr: m.Addr, RaftAddr: m.RaftAddr})
 	}
 
+	// The ring is announced only when it actually changed. Every policy
+	// generation is an entry too, and a line about the ring for an entry that
+	// moved no tenant is noise in the one log somebody reads during a
+	// rebalance.
+	var lastEpoch atomic.Uint64
+
 	rc := cfg.Cluster.Raft
 	c, err := cluster.StartConsensus(cluster.ConsensusOptions{
 		NodeID:             cfg.Node.ID,
@@ -381,8 +409,10 @@ func startConsensus(ctx context.Context, cfg config.Config, view *cluster.View, 
 					"epoch", s.RingEpoch, "err", err)
 				return
 			}
-			log.Info("ring updated from the log",
-				"epoch", s.RingEpoch, "members", len(s.Members), "vnodes", s.VNodes)
+			if lastEpoch.Swap(s.RingEpoch) != s.RingEpoch {
+				log.Info("ring updated from the log",
+					"epoch", s.RingEpoch, "members", len(s.Members), "vnodes", s.VNodes)
+			}
 			// The log is the truth, and a file that disagrees with it is a
 			// question worth asking out loud: somebody edited the member list
 			// and restarted expecting it to take effect, and it did not.
@@ -408,6 +438,48 @@ func startConsensus(ctx context.Context, cfg config.Config, view *cluster.View, 
 	// for: it is already enforcing, against the ring the file gave it.
 	go seedRing(ctx, c, log)
 	return c, nil
+}
+
+// buildStoreGuard watches whether the counter store is still the one the
+// cluster agreed on.
+//
+// It needs both halves to mean anything: a counter store whose identity can be
+// read, and a log to agree on it through. With either missing there is nothing
+// to disagree about -- one process and one Redis cannot be out of step -- so
+// the guard is simply absent rather than present and permanently open.
+func buildStoreGuard(ctx context.Context, store *redislimiter.Checker, consensus *cluster.Consensus, log *slog.Logger) *storegen.Guard {
+	if store == nil || consensus == nil {
+		return nil
+	}
+	if faultRemoved("no_store_gen") {
+		// The control for the store-wipe scenario: with nothing naming the
+		// store, a wipe has to be a silent full-quota amnesty.
+		log.Warn("FAULT: the counter store is unnamed and unwatched")
+		return nil
+	}
+
+	guard := storegen.New(storegen.Options{
+		Store:     store,
+		Committed: func() uint64 { return consensus.State().StoreGen },
+		Propose: func(ctx context.Context, gen uint64) error {
+			_, err := consensus.Propose(ctx, cluster.Command{Kind: cluster.SetStoreGen, Gen: gen})
+			return err
+		},
+		Logger: log,
+	})
+
+	// Once before anything is served, so a gateway that starts against a
+	// store the cluster does not recognise refuses from its first request
+	// rather than from its first poll.
+	startCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err := guard.Reconcile(startCtx)
+	cancel()
+	if err != nil {
+		log.Warn("could not read the counter store's identity at startup; the guard will keep trying", "err", err)
+	}
+
+	go guard.Run(ctx)
+	return guard
 }
 
 // membersNotIn reports which configured shards the committed state does not

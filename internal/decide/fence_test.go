@@ -170,3 +170,95 @@ func TestARetryThatIsStillFencedRefusesRatherThanLooping(t *testing.T) {
 		t.Fatalf("the cache was invalidated %d times, want exactly 1", got)
 	}
 }
+
+// genSource hands out a policy stamped with a fixed generation until it is
+// invalidated, then one stamped with a newer one.
+type genSource struct {
+	oldGen, newGen uint64
+	invalidations  atomic.Int64
+}
+
+func (s *genSource) Lookup(context.Context, string) (policy.Policy, error) {
+	p := failOpen("free")
+	if s.invalidations.Load() > 0 {
+		p.Gen = s.newGen
+		p.Limits = []limiter.Limit{bucket("per-minute", 1, time.Minute)} // the tightened one
+		return p, nil
+	}
+	p.Gen = s.oldGen
+	p.Limits = []limiter.Limit{bucket("per-minute", 100, time.Minute)} // the wide one
+	return p, nil
+}
+
+func (s *genSource) Invalidate(string) { s.invalidations.Add(1) }
+
+// A node notices on its OWN that the copy of a policy it holds predates an
+// edit, without waiting to be refused by the store.
+//
+// That matters more here than it first appears. A tenant's checks are
+// coordinated by ONE node, so the owner is the only node whose generation ever
+// reaches the counter store for that tenant -- nothing else is in a position
+// to contradict it. Without this, a stale OWNER enforces its stale limit
+// indefinitely and the store-side fence never gets the chance to fire.
+func TestANodeRefreshesWhenItsPolicyPredatesTheClustersGeneration(t *testing.T) {
+	src := &genSource{oldGen: 3, newGen: 5}
+	s := New(limiter.NewMemory(limiter.WithClock(limiter.NewFakeClock(time.Unix(1_700_000_000, 0)))),
+		src, "node-a",
+		WithPolicyGeneration(func() uint64 { return 5 }))
+
+	out, err := s.Decide(context.Background(), Query{Tenant: "acme"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := src.invalidations.Load(); got != 1 {
+		t.Fatalf("the node refreshed %d times; it should notice its copy is behind and refresh once", got)
+	}
+	if out.Policy.Gen != 5 {
+		t.Fatalf("the decision used generation %d, want the refreshed 5", out.Policy.Gen)
+	}
+	if got := out.Result.Decisions[0].Limit; got != 1 {
+		t.Fatalf("the decision enforced a limit of %d, so it used the copy it already had", got)
+	}
+	if s.Stats().PolicyStale == 0 {
+		t.Fatal("the refresh was not counted")
+	}
+}
+
+// THE CONTROL. With no generation to compare against, the same node enforces
+// the copy it is holding -- which is what happened before this existed, and
+// what the scenario in scripts/policy-skew-test.sh measures as an
+// over-admission.
+func TestWithoutAClusterGenerationTheStaleCopyIsEnforced(t *testing.T) {
+	src := &genSource{oldGen: 3, newGen: 5}
+	s := New(limiter.NewMemory(limiter.WithClock(limiter.NewFakeClock(time.Unix(1_700_000_000, 0)))),
+		src, "node-a") // no WithPolicyGeneration
+
+	out, err := s.Decide(context.Background(), Query{Tenant: "acme"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := src.invalidations.Load(); got != 0 {
+		t.Fatalf("something refreshed (%d) with nothing to compare against, so the test above proves nothing", got)
+	}
+	if got := out.Result.Decisions[0].Limit; got != 100 {
+		t.Fatalf("the control enforced a limit of %d, want the stale 100", got)
+	}
+}
+
+// A source that stamps nothing is unfenced by design. Retrying against one
+// would refetch on every single request, forever.
+func TestAnUnstampedPolicyIsNotRefreshedForever(t *testing.T) {
+	src := &genSource{oldGen: 0, newGen: 0}
+	s := New(limiter.NewMemory(limiter.WithClock(limiter.NewFakeClock(time.Unix(1_700_000_000, 0)))),
+		src, "node-a",
+		WithPolicyGeneration(func() uint64 { return 9 }))
+
+	for i := 0; i < 5; i++ {
+		if _, err := s.Decide(context.Background(), Query{Tenant: "acme"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := src.invalidations.Load(); got != 0 {
+		t.Fatalf("an unstamped policy was invalidated %d times", got)
+	}
+}

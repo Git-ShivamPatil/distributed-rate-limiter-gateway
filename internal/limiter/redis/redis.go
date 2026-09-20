@@ -26,8 +26,9 @@ var checkSource string
 
 // Checker evaluates limits against Redis.
 type Checker struct {
-	client goredis.UniversalClient
-	script *goredis.Script
+	client   goredis.UniversalClient
+	script   *goredis.Script
+	storeGen *goredis.Script
 
 	// clock is a test seam and nothing else. When it is nil -- which is the
 	// only way the production constructor can leave it -- the script reads
@@ -41,7 +42,11 @@ type Option func(*Checker)
 
 // New builds a Checker over an existing client.
 func New(client goredis.UniversalClient, opts ...Option) *Checker {
-	c := &Checker{client: client, script: goredis.NewScript(checkSource)}
+	c := &Checker{
+		client:   client,
+		script:   goredis.NewScript(checkSource),
+		storeGen: goredis.NewScript(storeGenSource),
+	}
 	for _, o := range opts {
 		o(c)
 	}
@@ -69,6 +74,13 @@ func (c *Checker) Ping(ctx context.Context) error {
 func (c *Checker) Load(ctx context.Context) error {
 	if err := c.script.Load(ctx, c.client).Err(); err != nil {
 		return fmt.Errorf("redis: loading check script: %w", err)
+	}
+	// Both scripts, and at startup rather than on first use: a Redis that
+	// cannot compile the one that names the store would otherwise fail much
+	// later, on a reconnect, in the middle of deciding whether the store had
+	// been replaced.
+	if err := c.storeGen.Load(ctx, c.client).Err(); err != nil {
+		return fmt.Errorf("redis: loading store generation script: %w", err)
 	}
 	return nil
 }

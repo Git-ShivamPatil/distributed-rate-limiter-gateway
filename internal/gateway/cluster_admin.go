@@ -92,7 +92,7 @@ func (s *Server) adminRemoveMember(w http.ResponseWriter, r *http.Request) {
 //
 // It reports whether the caller should stop, having already answered.
 func (s *Server) bumpPolicyGen(w http.ResponseWriter, r *http.Request, what string) bool {
-	if s.control == nil {
+	if s.control == nil || s.noPolicyGen {
 		return false // no log; policies are unfenced, which is the single-node case
 	}
 

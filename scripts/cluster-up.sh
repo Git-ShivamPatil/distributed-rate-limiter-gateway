@@ -25,6 +25,10 @@ BASE_RAFT="${BASE_RAFT:-19200}"
 # member list below being the membership for the life of the process, which is
 # what this script did before there was a log to commit it to.
 RAFT="${RAFT:-1}"
+# STALE_NODE=N pins node N behind: no change notifications and an hour-long
+# policy cache, so it keeps serving whatever it last read. It exists for the
+# policy-skew scenario, where something has to actually BE out of date.
+STALE_NODE="${STALE_NODE:-0}"
 REDIS="${REDIS_ADDR:-127.0.0.1:6379}"
 DSN="${POSTGRES_DSN:-postgres://gateway:gateway@127.0.0.1:5432/gateway?sslmode=disable}"
 ADMIN_TOKEN="${GATEWAY_ADMIN_TOKEN:-cluster-admin-token}"
@@ -76,6 +80,14 @@ for i in $(seq 1 "${NODES}"); do
   grpc=$((BASE_GRPC + i))
   cfg="${DIR}/gateway-${i}.yaml"
 
+  cache_ttl=5s
+  listens=true
+  if [ "${STALE_NODE}" = "${i}" ]; then
+    cache_ttl=1h
+    listens=false
+    echo "gateway-${i} is pinned behind: cache_ttl=1h, no change notifications"
+  fi
+
   cat >"${cfg}" <<YAML
 node:
   id: gateway-${i}
@@ -92,9 +104,9 @@ postgres:
   dsn: "${DSN}"
 policy:
   store: postgres
-  cache_ttl: 5s
-  stale_for: 5m
-  listen_for_changes: true
+  cache_ttl: ${cache_ttl}
+  stale_for: 24h
+  listen_for_changes: ${listens}
 auth:
   api_keys: true
   admin_token_env: GATEWAY_ADMIN_TOKEN

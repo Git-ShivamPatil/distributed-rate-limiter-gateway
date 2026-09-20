@@ -25,6 +25,7 @@ import (
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/decide"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/policy"
+	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/storegen"
 )
 
 // TenantHeader names the tenant a decision is asked about.
@@ -50,6 +51,11 @@ type Server struct {
 	cache      *policy.Cache
 	consensus  func() cluster.Stats
 	control    ClusterController
+	storeGuard func() storegen.Stats
+	// noPolicyGen is set only by a fault-injection build, and only so that the
+	// scenario which proves the generation matters has something to compare
+	// against.
+	noPolicyGen bool
 }
 
 // Option configures a Server.
@@ -63,6 +69,23 @@ func WithProxy(p *Proxy) Option { return func(s *Server) { s.proxy = p } }
 
 // WithCluster supplies the ring view that /v1/cluster reports.
 func WithCluster(v *cluster.View) Option { return func(s *Server) { s.cluster = v } }
+
+// WithoutPolicyGenerations stops policy edits minting a generation.
+//
+// Nothing in a production build calls it. It exists so that the scenario which
+// proves the generation is load-bearing can run the same steps without it and
+// watch them over-admit -- a check that cannot fail when the mechanism is
+// removed is not evidence that the mechanism works.
+func WithoutPolicyGenerations() Option {
+	return func(s *Server) { s.noPolicyGen = true }
+}
+
+// WithStoreGuard makes /v1/cluster report whether this node is refusing every
+// tenant because the counter store is not the one the cluster agreed on. When
+// a gateway is answering 503 to everything, that is the first thing to look at.
+func WithStoreGuard(stats func() storegen.Stats) Option {
+	return func(s *Server) { s.storeGuard = stats }
+}
 
 // WithConsensus makes /v1/cluster report where this node sits in the log:
 // which node is leading, and how far behind this one is.
@@ -197,12 +220,19 @@ func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 	if s.consensus != nil {
 		body["raft"] = s.consensus()
 	}
+	if s.storeGuard != nil {
+		body["store"] = s.storeGuard()
+	}
 	if s.decider != nil {
 		st := s.decider.Stats()
 		body["decisions"] = map[string]int64{
 			"local":     st.Local,
 			"forwarded": st.Forwarded,
 			"fell_back": st.FellBack,
+			// A fence that fires silently cannot be told from one that never
+			// fires, so both counts are published beside the decisions.
+			"policy_stale": st.PolicyStale,
+			"store_fenced": st.StoreFenced,
 		}
 	}
 	writeJSON(w, http.StatusOK, body)

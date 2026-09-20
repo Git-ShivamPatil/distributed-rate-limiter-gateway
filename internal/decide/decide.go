@@ -45,6 +45,20 @@ var ErrPeerUnavailable = errors.New("decide: the owning node did not answer")
 // prevent -- which is why it refuses whatever the failure mode says.
 var ErrFenced = errors.New("decide: this node is behind the cluster and may not decide")
 
+// StoreGuard decides whether this node may answer at all.
+//
+// It is consulted before anything else, including the ring: a node that has
+// been told the counter store is not the one the cluster agreed on has no
+// business forwarding the question either, because every node is looking at
+// the same store.
+type StoreGuard interface {
+	// Check returns non-nil when this node must refuse everything.
+	Check() error
+	// Fence latches it closed, for the case where the store says so in the
+	// middle of a check rather than on the out-of-band probe.
+	Fence(reason string)
+}
+
 // Invalidator drops a cached policy. A Source that caches implements it; one
 // that reads through does not need to.
 type Invalidator interface {
@@ -131,9 +145,11 @@ type Service struct {
 	clock    func() time.Time
 	log      *slog.Logger
 
-	cluster    ClusterView
-	forwarder  Forwarder
-	storeGenOf func() uint64
+	cluster     ClusterView
+	forwarder   Forwarder
+	storeGenOf  func() uint64
+	policyGenOf func() uint64
+	guard       StoreGuard
 
 	local       atomic.Int64
 	forwarded   atomic.Int64
@@ -150,6 +166,25 @@ func WithHub(h *events.Hub) Option { return func(s *Service) { s.hub = h } }
 
 // WithClock replaces the timestamp source on published decisions.
 func WithClock(fn func() time.Time) Option { return func(s *Service) { s.clock = fn } }
+
+// WithPolicyGeneration supplies the newest policy generation the cluster has
+// minted, as this node last heard it.
+//
+// It is what lets a node notice on its OWN that the copy of a policy it is
+// holding predates an edit, without waiting to be refused. That matters more
+// here than the design it came from assumed: a tenant's checks are coordinated
+// by ONE node, so the owner is the only node whose generation ever reaches the
+// counter store for that tenant, and nothing else is in a position to
+// contradict it. The store-side fence still covers the case this cannot -- a
+// node cut off from the log, whose idea of the newest generation is itself out
+// of date -- so the two mechanisms cover each other rather than overlapping.
+func WithPolicyGeneration(fn func() uint64) Option {
+	return func(s *Service) { s.policyGenOf = fn }
+}
+
+// WithStoreGuard makes this node refuse everything while the counter store is
+// not the one the cluster agreed on.
+func WithStoreGuard(g StoreGuard) Option { return func(s *Service) { s.guard = g } }
 
 // WithStoreGeneration supplies which lifetime of the counter store this node
 // believes it is talking to. Without it, checks are unfenced against the store.
@@ -196,6 +231,13 @@ func (s *Service) storeGen() uint64 {
 	return s.storeGenOf()
 }
 
+func (s *Service) newestPolicyGen() uint64 {
+	if s.policyGenOf == nil {
+		return 0
+	}
+	return s.policyGenOf()
+}
+
 // Node reports which node this is, which every answer carries.
 func (s *Service) Node() string { return s.node }
 
@@ -210,6 +252,18 @@ func (s *Service) Decide(ctx context.Context, q Query) (Outcome, error) {
 	if q.Tenant == "" {
 		return Outcome{}, ErrNoTenant
 	}
+
+	// Before anything, including the ring. Every node reads the same counter
+	// store, so a node that has been told the store was replaced cannot fix it
+	// by asking a different node -- and must not admit anything on the
+	// strength of counters that may have been reset underneath it.
+	if s.guard != nil {
+		if err := s.guard.Check(); err != nil {
+			s.storeFenced.Add(1)
+			return Outcome{}, fmt.Errorf("%w: %v", ErrFenced, err)
+		}
+	}
+
 	// Nothing in a production build; see fault_off.go.
 	if err := s.faultHook(ctx); err != nil {
 		return Outcome{}, fmt.Errorf("%w: %v", ErrStoreUnavailable, err)
@@ -233,6 +287,21 @@ func (s *Service) decideHere(ctx context.Context, q Query, refreshed bool) (Outc
 		// themselves; a store failure passes through as itself too, because
 		// "we could not find out" is not "there is no such tenant".
 		return Outcome{}, err
+	}
+
+	// This node's copy of the policy predates a generation the cluster has
+	// already minted, so an edit landed that it has not read yet. Refreshing
+	// before enforcing is the difference between "the limit tightened a
+	// moment ago" and "this node kept enforcing the old one until its cache
+	// happened to lapse".
+	//
+	// Only when the copy carries a generation at all: a source that stamps
+	// nothing is unfenced by design, and retrying against it would refetch on
+	// every single request forever.
+	if pol.Gen > 0 && !refreshed && s.newestPolicyGen() > pol.Gen {
+		s.policyStale.Add(1)
+		s.invalidate(q.Tenant)
+		return s.decideHere(ctx, q, true)
 	}
 
 	limits := pol.LimitsFor(q.Method, q.Path)
@@ -274,6 +343,14 @@ func (s *Service) decideHere(ctx context.Context, q Query, refreshed bool) (Outc
 		}
 		if errors.Is(err, limiter.ErrStoreReset) {
 			s.storeFenced.Add(1)
+			// One store, one answer. The script has just established that this
+			// tenant's counters belong to a different generation; every other
+			// tenant's counters are in the same store, so serving the next one
+			// as though nothing had happened would leave the amnesty's size a
+			// function of which tenants happen to check in.
+			if s.guard != nil {
+				s.guard.Fence(fmt.Sprintf("a check for %q was refused by the store's own generation", q.Tenant))
+			}
 			s.log.Error("the counter store is not the one this generation was minted for; refusing",
 				"tenant", q.Tenant, "err", err)
 			return Outcome{Policy: pol}, fmt.Errorf("%w: %v", ErrFenced, err)

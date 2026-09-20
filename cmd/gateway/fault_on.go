@@ -30,6 +30,18 @@ const (
 	// break traffic, because every request now waits on a log that has no
 	// leader to append to.
 	FaultRaftCounters = "raft_counters"
+
+	// FaultNoStoreGen removes the store generation entirely: nothing names the
+	// counter store and nothing notices when it is replaced. It is the control
+	// for "a wipe is detected, counted and bounded" -- with it on, wiping the
+	// store has to hand every tenant a full fresh quota in silence.
+	FaultNoStoreGen = "no_store_gen"
+
+	// FaultNoPolicyGen stops policy edits minting a generation, so nothing
+	// fences a node still carrying the old limits. It is the control for "a
+	// widening is un-appliable": with it on, a node pinned to a stale policy
+	// has to keep enforcing the looser limit it holds.
+	FaultNoPolicyGen = "no_policy_gen"
 )
 
 func installFaults(c *cluster.Consensus, log *slog.Logger) {
@@ -38,6 +50,10 @@ func installFaults(c *cluster.Consensus, log *slog.Logger) {
 		return
 	}
 	switch name {
+	case FaultNoStoreGen, FaultNoPolicyGen:
+		// Both are removals rather than additions: the code that would have
+		// built the mechanism asks faultRemoved and skips it. Nothing to
+		// install here beyond the announcement below.
 	case FaultRaftCounters:
 		if c == nil {
 			log.Error("fault needs consensus, and this node has none", "fault", name)
@@ -57,3 +73,7 @@ func installFaults(c *cluster.Consensus, log *slog.Logger) {
 	}
 	log.Warn("FAULT INJECTED -- this build is deliberately broken and must never be deployed", "fault", name)
 }
+
+// faultRemoved reports whether a named mechanism has been taken out of this
+// build.
+func faultRemoved(name string) bool { return os.Getenv(FaultEnv) == name }

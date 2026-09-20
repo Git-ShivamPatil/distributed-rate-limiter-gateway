@@ -309,6 +309,87 @@ jobs:
       - name: the same scenario with consensus on the request path, which must break
         run: ./scripts/kill-leader.sh --control
 
+  policy-skew:
+    name: A tightened limit is not outrun by a node holding the old one
+    runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: gateway
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gateway"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # One node is pinned behind -- no change notifications, an hour-long
+      # cache -- and owns the tenant, so its own stale copy is what decides.
+      - name: policy skew
+        run: ./scripts/policy-skew-test.sh
+      # The control: with no generation minted, that node MUST keep enforcing
+      # the limit it is holding. It admits 300 against a limit of 100.
+      - name: the same scenario with no generation, which must over-admit
+        run: ./scripts/policy-skew-test.sh --control
+
+  store-wipe:
+    name: Losing every counter is detected, not silent
+    runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: gateway
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gateway"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: install redis-cli
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq redis-tools
+      # A limitation test. Nothing survives losing every counter; what is
+      # asserted is that the loss is detected, refused while it lasts, and
+      # bounded by a generation that outranks the one before it.
+      - name: store wipe
+        run: ./scripts/store-wipe-test.sh
+      # The control: with no store generation, the wipe MUST go unnoticed and
+      # the quota MUST come back in silence.
+      - name: the same wipe with nothing naming the store, which must go unnoticed
+        run: ./scripts/store-wipe-test.sh --control
+
   case-study:
     name: The commands the case study publishes
     runs-on: ubuntu-24.04
