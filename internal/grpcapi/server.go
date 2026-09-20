@@ -208,6 +208,9 @@ func (s *Server) statusFor(err error, tenant string) error {
 		return status.Error(codes.InvalidArgument, err.Error())
 	case errors.Is(err, decide.ErrNoTenant):
 		return status.Error(codes.InvalidArgument, "tenant_id is required")
+	case errors.Is(err, decide.ErrFenced):
+		return status.Error(codes.Unavailable,
+			"this node is behind the cluster and refused to decide rather than enforce a stale policy")
 	case errors.Is(err, decide.ErrStoreUnavailable):
 		// Not RESOURCE_EXHAUSTED: the caller is within its quota as far as
 		// anybody knows. Saying otherwise would send them away to wait for a

@@ -34,6 +34,23 @@ var ErrNoTenant = errors.New("decide: no tenant named")
 // property of this package's design, not of how the forward was attempted.
 var ErrPeerUnavailable = errors.New("decide: the owning node did not answer")
 
+// ErrFenced means the counter store refused this node because it is
+// demonstrably behind the cluster: it offered a policy older than one already
+// enforced, or it is talking to a store its generation was not minted for.
+//
+// It is deliberately NOT ErrStoreUnavailable. An unreachable store leaves the
+// meaning to the tenant's failure mode, and a tenant that fails open is
+// admitted. A fence has already established that this node is out of date, so
+// admitting on its say-so is exactly the over-admission the fence exists to
+// prevent -- which is why it refuses whatever the failure mode says.
+var ErrFenced = errors.New("decide: this node is behind the cluster and may not decide")
+
+// Invalidator drops a cached policy. A Source that caches implements it; one
+// that reads through does not need to.
+type Invalidator interface {
+	Invalidate(tenant string)
+}
+
 // ErrStoreUnavailable means the counter store could not decide and the policy
 // fails closed. It is deliberately not "refused": the caller is within its
 // quota as far as anybody knows, and a 429 would be a lie about why.
@@ -96,6 +113,13 @@ type Stats struct {
 	// FellBack counts decisions made here after the owner could not be
 	// reached. It is the number that says whether the ring is healthy.
 	FellBack int64
+	// PolicyStale counts checks the store refused because this node offered an
+	// older policy than one already enforced, and StoreFenced counts those it
+	// refused because the store is not the one this node's generation was
+	// minted for. Both are published: a fence that fires silently is
+	// indistinguishable from one that never fires.
+	PolicyStale int64
+	StoreFenced int64
 }
 
 // Service answers admission questions.
@@ -110,9 +134,11 @@ type Service struct {
 	cluster   ClusterView
 	forwarder Forwarder
 
-	local     atomic.Int64
-	forwarded atomic.Int64
-	fellBack  atomic.Int64
+	local       atomic.Int64
+	forwarded   atomic.Int64
+	fellBack    atomic.Int64
+	policyStale atomic.Int64
+	storeFenced atomic.Int64
 }
 
 // Option configures a Service.
@@ -148,9 +174,11 @@ func New(checker limiter.Checker, policies policy.Source, node string, opts ...O
 // Stats reports the split between local and forwarded decisions.
 func (s *Service) Stats() Stats {
 	return Stats{
-		Local:     s.local.Load(),
-		Forwarded: s.forwarded.Load(),
-		FellBack:  s.fellBack.Load(),
+		Local:       s.local.Load(),
+		Forwarded:   s.forwarded.Load(),
+		FellBack:    s.fellBack.Load(),
+		PolicyStale: s.policyStale.Load(),
+		StoreFenced: s.storeFenced.Load(),
 	}
 }
 
@@ -176,7 +204,15 @@ func (s *Service) Decide(ctx context.Context, q Query) (Outcome, error) {
 	if out, handled, err := s.maybeForward(ctx, q); handled {
 		return out, err
 	}
+	return s.decideHere(ctx, q, false)
+}
 
+// decideHere answers without consulting the ring.
+//
+// refreshed says this is the second attempt, after the store told us our
+// policy was out of date and we dropped the cached copy. There is no third:
+// two nodes could otherwise bounce a tenant between them refreshing forever.
+func (s *Service) decideHere(ctx context.Context, q Query, refreshed bool) (Outcome, error) {
 	pol, err := s.policies.Lookup(ctx, q.Tenant)
 	if err != nil {
 		// policy.ErrTenantNotFound and ErrTenantDisabled pass through as
@@ -197,6 +233,32 @@ func (s *Service) Decide(ctx context.Context, q Query) (Outcome, error) {
 		if errors.Is(err, limiter.ErrCostExceedsCapacity) {
 			return Outcome{}, err
 		}
+
+		// A FENCE, which is not a store failure, and must be answered before
+		// the failure-mode branch below ever runs. That branch admits a
+		// fail_open tenant, and doing so here would hand out quota on the
+		// authority of a node the store has just established is out of date.
+		if errors.Is(err, limiter.ErrPolicyStale) {
+			s.policyStale.Add(1)
+			if !refreshed {
+				// The edit is already in the policy store; this node simply
+				// had not heard. Drop the cached copy and ask again -- which
+				// turns a fence into a few milliseconds rather than a cache
+				// lifetime of refusals.
+				s.invalidate(q.Tenant)
+				return s.decideHere(ctx, q, true)
+			}
+			s.log.Warn("still carrying an old policy after refreshing; refusing rather than enforcing it",
+				"tenant", q.Tenant, "err", err)
+			return Outcome{Policy: pol}, fmt.Errorf("%w: %v", ErrFenced, err)
+		}
+		if errors.Is(err, limiter.ErrStoreReset) {
+			s.storeFenced.Add(1)
+			s.log.Error("the counter store is not the one this generation was minted for; refusing",
+				"tenant", q.Tenant, "err", err)
+			return Outcome{Policy: pol}, fmt.Errorf("%w: %v", ErrFenced, err)
+		}
+
 		// The store could not decide. What that means is a policy decision:
 		// refusing takes the tenant down with the store, admitting stops
 		// enforcing for the duration. Either way the answer says so.
@@ -265,6 +327,14 @@ func (s *Service) maybeForward(ctx context.Context, q Query) (Outcome, bool, err
 	// Anything else is an answer ABOUT the tenant -- unknown, disabled, a cost
 	// no quota could admit -- and must be passed through rather than retried.
 	return Outcome{}, true, err
+}
+
+// invalidate drops this node's cached copy of a tenant's policy, when the
+// source is something that caches at all.
+func (s *Service) invalidate(tenant string) {
+	if inv, ok := s.policies.(Invalidator); ok {
+		inv.Invalidate(tenant)
+	}
 }
 
 func (s *Service) publish(q Query, out Outcome) {

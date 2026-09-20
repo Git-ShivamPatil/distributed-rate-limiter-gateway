@@ -17,12 +17,19 @@
 -- Requires Redis 7: it replicates script effects rather than the script, which
 -- is what makes a write after TIME legal.
 --
--- KEYS[i]  one key per limit, all sharing the tenant hash tag so a cluster
---          keeps them in one slot
+-- KEYS[1]      the tenant's meta key, holding the two fences. It shares the
+--              tenant hash tag but NOT the counter prefix, so that clearing a
+--              tenant's counters cannot clear its fences.
+-- KEYS[i + 1]  one key per limit, all sharing the tenant hash tag so a cluster
+--              keeps them in one slot
 --
--- ARGV[1]  cost, in units
--- ARGV[2]  1 to peek (decide and report, consume nothing)
--- ARGV[3]  clock override in microseconds, 0 to read Redis TIME. Only the
+-- ARGV[1]  store generation: which lifetime of this Redis the caller believes
+--          it is talking to. 0 means the caller is not fenced.
+-- ARGV[2]  policy generation: how recent the caller's copy of the policy is.
+--          0 means the caller is not fenced.
+-- ARGV[3]  cost, in units
+-- ARGV[4]  1 to peek (decide and report, consume nothing)
+-- ARGV[5]  clock override in microseconds, 0 to read Redis TIME. Only the
 --          differential test against the in-memory oracle passes a value; the
 --          production constructor has no way to set it.
 -- then four values per limit, in the order of KEYS:
@@ -31,12 +38,70 @@
 --   b         tb: tolerance in microseconds (emission * capacity); sw: count
 --   capacity  the number reported as the limit
 --
--- Returns a flat array: allowed, then four values per limit --
---   allowed, remaining, retry_after_us, reset_after_us
+-- Returns a flat array whose FIRST element is a status:
+--   {0, allowed, then four values per limit -- allowed, remaining,
+--    retry_after_us, reset_after_us}
+--   {1, stored_policy_gen}  the caller's policy is older than one already
+--                           enforced here; nothing was read or written
+--   {2, stored_store_gen}   this is not the store the caller's generation was
+--                           minted for; nothing was read or written
+--
+-- The status is a VALUE and not an error reply, and that is load-bearing. A
+-- caller that receives an error cannot tell a fence from an unreachable store,
+-- and a tenant whose policy says fail_open would be ADMITTED by exactly the
+-- check that exists to refuse it.
 
-local cost = tonumber(ARGV[1])
-local peek = tonumber(ARGV[2])
-local override = tonumber(ARGV[3])
+local store_gen = tonumber(ARGV[1])
+local policy_gen = tonumber(ARGV[2])
+local cost = tonumber(ARGV[3])
+local peek = tonumber(ARGV[4])
+local override = tonumber(ARGV[5])
+
+local STATUS_OK = 0
+local STATUS_POLICY_STALE = 1
+local STATUS_STORE_RESET = 2
+
+local meta_key = KEYS[1]
+
+-- The fences, evaluated before a single counter is read.
+--
+-- An ABSENT meta adopts whatever the caller carries and never refuses. It has
+-- to: every tenant's first request finds no meta, and a fence that rejected it
+-- would refuse all traffic everywhere the first time it shipped.
+local meta = redis.call('HMGET', meta_key, 'store_gen', 'policy_gen')
+local stored_store = tonumber(meta[1])
+local stored_policy = tonumber(meta[2])
+
+-- A store generation that DIFFERS IN EITHER DIRECTION is a different store.
+-- Not "lower": a wipe followed by a re-mint can hand out a number below the
+-- one a surviving node still carries, and treating that as acceptable is the
+-- silent full-quota amnesty the generation exists to catch.
+if store_gen > 0 and stored_store and stored_store ~= store_gen then
+  return { STATUS_STORE_RESET, stored_store }
+end
+
+-- A policy generation BELOW the one already enforced means this caller is
+-- carrying a limit the cluster has replaced. Enforcing it would put max(old,
+-- new) in effect for the whole skew window, which for a tightening is the
+-- over-admission nobody sees.
+if policy_gen > 0 and stored_policy and policy_gen < stored_policy then
+  return { STATUS_POLICY_STALE, stored_policy }
+end
+
+-- Past the fences, so record what the caller carries.
+--
+-- This happens on EVERY call -- denials and peeks included -- and never
+-- expires. Advancing it only on admitted requests would let a tightening be
+-- outrun by exhausting the quota first: every later request is a denial, the
+-- stored generation never moves, and the node carrying the old wider limit is
+-- never fenced. A generation is not quota, so writing one does not make a
+-- refused request consume anything.
+if store_gen > 0 and stored_store == nil then
+  redis.call('HSET', meta_key, 'store_gen', string.format('%.0f', store_gen))
+end
+if policy_gen > 0 and (stored_policy == nil or policy_gen > stored_policy) then
+  redis.call('HSET', meta_key, 'policy_gen', string.format('%.0f', policy_gen))
+end
 
 local now
 if override > 0 then
@@ -51,7 +116,7 @@ local function clamp(v)
   return v
 end
 
-local n = #KEYS
+local n = #KEYS - 1
 local allowed_all = 1
 
 -- One entry per limit, holding both the "if this is admitted" numbers and the
@@ -61,12 +126,12 @@ local allowed_all = 1
 local state = {}
 
 for i = 1, n do
-  local base = 3 + (i - 1) * 4
+  local base = 5 + (i - 1) * 4
   local kind = ARGV[base + 1]
   local a = tonumber(ARGV[base + 2])
   local b = tonumber(ARGV[base + 3])
   local capacity = tonumber(ARGV[base + 4])
-  local key = KEYS[i]
+  local key = KEYS[i + 1]
 
   local s = { kind = kind, key = key, capacity = capacity, allowed = 1, retry = 0 }
 
@@ -186,7 +251,7 @@ if allowed_all == 1 and peek == 0 and cost > 0 then
   end
 end
 
-local out = { allowed_all }
+local out = { STATUS_OK, allowed_all }
 for i = 1, n do
   local s = state[i]
   local remaining, reset

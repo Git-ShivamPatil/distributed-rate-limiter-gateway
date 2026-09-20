@@ -362,6 +362,13 @@ func (s *Server) writeDecideError(w http.ResponseWriter, tenant string, err erro
 	case errors.Is(err, limiter.ErrCostExceedsCapacity):
 		// Not 429: waiting will never help, so a Retry-After would be a lie.
 		writeError(w, http.StatusBadRequest, "cost_too_large", err.Error())
+	case errors.Is(err, decide.ErrFenced):
+		// Not 429. The tenant is not over its quota as far as anybody knows --
+		// this NODE is out of date and refused to guess. Saying "too many
+		// requests" would send a caller away to wait out a limit it may never
+		// have hit.
+		writeError(w, http.StatusServiceUnavailable, "node_behind",
+			"this node is behind the cluster and refused to decide rather than enforce a stale policy")
 	case errors.Is(err, decide.ErrNoTenant):
 		writeError(w, http.StatusBadRequest, "tenant_missing", err.Error())
 	case errors.Is(err, decide.ErrStoreUnavailable):

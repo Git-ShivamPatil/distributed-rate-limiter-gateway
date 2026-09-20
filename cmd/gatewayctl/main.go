@@ -163,6 +163,9 @@ func runCounters(ctx context.Context, words []string, addr, tenant string) error
 
 	// The same shape internal/limiter builds: every key of one tenant shares
 	// the braced tenant segment.
+	// Counters only. A tenant's fences live under a different prefix on
+	// purpose (see limiter.MetaKey): sweeping them up here would un-fence the
+	// tenant, which is the same failure as never having fenced it.
 	pattern := "rl1:{" + tenant + "}:*"
 	var (
 		cursor  uint64

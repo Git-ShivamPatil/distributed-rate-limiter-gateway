@@ -98,9 +98,11 @@ func (c *Checker) Check(ctx context.Context, req limiter.Request) (limiter.Resul
 		override = c.clock.Now().UnixMicro()
 	}
 
-	keys := make([]string, 0, len(req.Limits))
-	argv := make([]any, 0, 3+4*len(req.Limits))
-	argv = append(argv, cost, peek, override)
+	// The meta key leads, so the fences are read before a counter is.
+	keys := make([]string, 0, 1+len(req.Limits))
+	keys = append(keys, limiter.MetaKey(req.Tenant))
+	argv := make([]any, 0, 5+4*len(req.Limits))
+	argv = append(argv, req.StoreGen, req.PolicyGen, cost, peek, override)
 
 	for _, l := range req.Limits {
 		keys = append(keys, l.Key(req.Tenant))
@@ -118,7 +120,7 @@ func (c *Checker) Check(ctx context.Context, req limiter.Request) (limiter.Resul
 	if err != nil {
 		return limiter.Result{}, fmt.Errorf("redis: check: %w", err)
 	}
-	return parseResult(raw, req.Limits)
+	return parseResult(raw, req)
 }
 
 func micros(d time.Duration) int64 { return int64(d / time.Microsecond) }
@@ -127,18 +129,44 @@ func micros(d time.Duration) int64 { return int64(d / time.Microsecond) }
 // understand, which is a bug in one of the two rather than a limit decision.
 var ErrMalformedReply = errors.New("redis: malformed reply from check script")
 
-func parseResult(raw any, limits []limiter.Limit) (limiter.Result, error) {
+// Status codes the script leads its reply with. They are values rather than
+// error replies because a caller that receives an error cannot tell a fence
+// from an unreachable store, and would hand a fail_open tenant the admission
+// the fence exists to refuse.
+const (
+	statusOK          = 0
+	statusPolicyStale = 1
+	statusStoreReset  = 2
+)
+
+func parseResult(raw any, req limiter.Request) (limiter.Result, error) {
+	limits := req.Limits
 	values, ok := raw.([]any)
 	if !ok {
 		return limiter.Result{}, fmt.Errorf("%w: %T", ErrMalformedReply, raw)
 	}
-	want := 1 + 4*len(limits)
+	if len(values) == 0 {
+		return limiter.Result{}, fmt.Errorf("%w: empty reply", ErrMalformedReply)
+	}
+
+	// The status is read BEFORE the length is checked: a fenced reply is two
+	// values long whatever the request asked for, so checking the length first
+	// would report a malformed script instead of the refusal it actually is.
+	status, err := toInt(values[0])
+	if err != nil {
+		return limiter.Result{}, err
+	}
+	if status != statusOK {
+		return limiter.Result{}, fenceError(status, values, req)
+	}
+
+	want := 2 + 4*len(limits)
 	if len(values) != want {
 		return limiter.Result{}, fmt.Errorf("%w: %d values for %d limits, want %d",
 			ErrMalformedReply, len(values), len(limits), want)
 	}
 
-	allowedAll, err := toInt(values[0])
+	allowedAll, err := toInt(values[1])
 	if err != nil {
 		return limiter.Result{}, err
 	}
@@ -148,7 +176,7 @@ func parseResult(raw any, limits []limiter.Limit) (limiter.Result, error) {
 		Decisions: make([]limiter.Decision, 0, len(limits)),
 	}
 	for i, l := range limits {
-		base := 1 + i*4
+		base := 2 + i*4
 		allowed, err := toInt(values[base])
 		if err != nil {
 			return limiter.Result{}, err
@@ -178,6 +206,25 @@ func parseResult(raw any, limits []limiter.Limit) (limiter.Result, error) {
 		res.Limiting = worstRefusal(res.Decisions)
 	}
 	return res, nil
+}
+
+// fenceError turns a refusing status into the error the decision path branches
+// on.
+func fenceError(status int64, values []any, req limiter.Request) error {
+	var stored int64
+	if len(values) > 1 {
+		if n, err := toInt(values[1]); err == nil {
+			stored = n
+		}
+	}
+	switch status {
+	case statusPolicyStale:
+		return &limiter.FenceError{Kind: limiter.ErrPolicyStale, Sent: req.PolicyGen, Stored: uint64(stored)}
+	case statusStoreReset:
+		return &limiter.FenceError{Kind: limiter.ErrStoreReset, Sent: req.StoreGen, Stored: uint64(stored)}
+	default:
+		return fmt.Errorf("%w: unknown status %d", ErrMalformedReply, status)
+	}
 }
 
 func worstRefusal(ds []limiter.Decision) string {

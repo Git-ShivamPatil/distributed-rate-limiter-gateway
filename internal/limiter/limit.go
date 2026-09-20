@@ -22,6 +22,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -186,6 +187,21 @@ func (l Limit) Key(tenant string) string {
 	return "rl1:{" + tenant + "}:" + l.Name + ":" + l.fingerprint()
 }
 
+// MetaKey is where a tenant's fences live: which lifetime of the counter store
+// its counters belong to, and how recent a policy has been enforced against it.
+//
+// It shares the tenant's hash tag, so one script can touch it alongside every
+// counter, and it deliberately does NOT share the "rl1:" counter prefix. A
+// tenant's counters are cleared by scanning that prefix, and a fence swept up
+// by a counter reset would silently un-fence the tenant -- which is the same
+// failure as never having fenced it, arriving later and harder to see.
+//
+// It never expires. An expired fence and an absent fence are the same thing,
+// and an absent fence adopts whatever the next caller carries.
+func MetaKey(tenant string) string {
+	return "rl1meta:{" + tenant + "}"
+}
+
 // Decision is the outcome for a single limit.
 type Decision struct {
 	Name      string `json:"name"`
@@ -210,6 +226,17 @@ type Request struct {
 	// PeekOnly reports what would happen without consuming anything. It is how
 	// GetQuota answers, and it never mutates state.
 	PeekOnly bool
+
+	// StoreGen names the lifetime of the counter store this caller believes it
+	// is talking to, and PolicyGen how recent its copy of the policy is. Both
+	// are totally ordered by the cluster's log, and both are compared inside
+	// the store rather than here: a caller that checks its own generation is a
+	// caller that can be out of date about being out of date.
+	//
+	// Zero means unfenced, which is what a single-node deployment and every
+	// test that is not about fencing pass.
+	StoreGen  uint64
+	PolicyGen uint64
 }
 
 // EffectiveCost is the cost after the zero-means-one rule.
@@ -222,6 +249,37 @@ func (r Request) EffectiveCost() int64 {
 	}
 	return r.Cost
 }
+
+// ErrPolicyStale means this node offered a limit older than one the store has
+// already enforced for that tenant.
+//
+// It is NOT a store outage, and the difference decides whether a tenant is
+// admitted or refused: a store that cannot answer leaves the policy's failure
+// mode to decide, while a fence has already established that this node is out
+// of date, so admitting on its say-so is precisely the over-admission the
+// fence exists to prevent.
+var ErrPolicyStale = errors.New("limiter: this node's policy is older than the one already enforced")
+
+// ErrStoreReset means the counter store is not the one this node's generation
+// was minted for -- it was wiped, replaced, or swapped underneath the cluster.
+var ErrStoreReset = errors.New("limiter: the counter store is not the one this generation was minted for")
+
+// FenceError carries which fence refused and the generations on both sides,
+// because "you are behind" is not actionable without "behind what".
+type FenceError struct {
+	// Kind is ErrPolicyStale or ErrStoreReset.
+	Kind error
+	// Sent is what this node carried; Stored is what the store already had.
+	Sent, Stored uint64
+}
+
+func (e *FenceError) Error() string {
+	return fmt.Sprintf("%v (this node carried %d, the store has %d)", e.Kind, e.Sent, e.Stored)
+}
+
+// Unwrap lets errors.Is find the sentinel, so a caller can branch on which
+// fence refused without knowing this type exists.
+func (e *FenceError) Unwrap() error { return e.Kind }
 
 // Result is the outcome of evaluating every limit in a Request.
 //
