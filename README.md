@@ -190,10 +190,13 @@ property of its timers and of the machine.
 **What proves that matters** is the control, because the quota assertion would
 also hold in a cluster with no consensus at all. The same scenario runs against
 a build made with `-tags faultinject` that puts consensus **on** the request
-path, where killing the leader is **required** to break traffic -- and it does:
-78 of 100 requests answer with neither a decision nor a refusal. That is the
-difference between "consensus is off the request path" and "consensus happened
-to be fast today". CI also asserts the fault seam is absent from a production
+path, where the same scenario is **required** to fail -- and it does: 78 of 100
+requests answer with neither a decision nor a refusal, against 0 in the clean
+run. Be precise about what that shows. Traffic goes to the two survivors, which
+are followers, and a follower cannot commit -- so the broken build starts
+failing at the first request rather than at the kill. What it demonstrates is
+that per-request consensus is unworkable at all, which is the reason the design
+keeps it off the path; it is not a measurement of the election itself. CI also asserts the fault seam is absent from a production
 binary *and present in the fault build*, so the check cannot pass by having
 been renamed.
 
@@ -263,9 +266,13 @@ one above the highest the cluster has ever committed, so the high-water mark
 lives somewhere the flush cannot reach and the generation after a wipe always
 outranks the one before it.
 
-Detection is three conditions, any of which fires: the run id changed, the
-generation key is absent, or its value differs from the committed one. When one
-does, this node refuses **every** tenant, not only the ones it has seen. The
+Detection is two conditions, either of which REFUSES: the generation key is
+absent, or its value differs from the committed one. A changed run id is a
+third signal and it does **not** refuse -- a store that came back with its data
+intact is a restart, not a replacement, and latching there would turn every
+Redis restart into an outage. It is logged, and a restart that also lost the
+data is caught by the absent key rather than by the run id. When one of the two
+does fire, this node refuses **every** tenant, not only the ones it has seen. The
 generation names the whole store and the probe fires before it could know which
 tenants were touched; refusing only the tenants that happen to check in next
 would leave every quiet one un-fenced and make the size of the amnesty a

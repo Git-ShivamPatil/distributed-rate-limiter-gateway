@@ -3,6 +3,7 @@ package decide
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/config"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/limiter"
 	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/policy"
+	"github.com/Git-ShivamPatil/distributed-rate-limiter-gateway/internal/ring"
 )
 
 // fencingChecker refuses the first n calls with a fence and then answers
@@ -260,5 +262,75 @@ func TestAnUnstampedPolicyIsNotRefreshedForever(t *testing.T) {
 	}
 	if got := src.invalidations.Load(); got != 0 {
 		t.Fatalf("an unstamped policy was invalidated %d times", got)
+	}
+}
+
+// countingView records every key ownership was resolved for, which is the only
+// way to pin what the ring is asked about.
+type countingView struct {
+	self string
+	mu   sync.Mutex
+	keys []string
+}
+
+func (v *countingView) Owner(key string) (ring.Node, bool, bool) {
+	v.mu.Lock()
+	v.keys = append(v.keys, key)
+	v.mu.Unlock()
+	return ring.Node{ID: v.self, Addr: "127.0.0.1:9999"}, true, true
+}
+
+func (v *countingView) Self() string { return v.self }
+
+func (v *countingView) seen() []string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	out := make([]string, len(v.keys))
+	copy(out, v.keys)
+	return out
+}
+
+type nilForwarder struct{}
+
+func (nilForwarder) Check(context.Context, string, Query) (Outcome, error) {
+	return Outcome{}, ErrPeerUnavailable
+}
+
+// Ownership is resolved for the TENANT ALONE, and this is the only place that
+// can be checked.
+//
+// The ring hashes whatever key it is handed, so it cannot enforce this itself
+// -- the property lives entirely in what the caller passes. The README's claim
+// that "a tenant always lands on the same shard" is false the moment anything
+// else is mixed in: a tenant with three limits would get three owners, and a
+// tenant whose requests hit two endpoints would get two.
+//
+// Before this existed, re-keying ownership to (tenant, method, path) left the
+// entire suite green.
+func TestOwnershipIsResolvedForTheTenantAlone(t *testing.T) {
+	view := &countingView{self: "node-a"}
+	s := New(limiter.NewMemory(limiter.WithClock(limiter.NewFakeClock(time.Unix(1_700_000_000, 0)))),
+		&source{p: failOpen("free")}, "node-a",
+		WithRing(view, nilForwarder{}))
+
+	// The same tenant, over three different requests.
+	for _, q := range []Query{
+		{Tenant: "acme"},
+		{Tenant: "acme", Method: "POST", Path: "/api/orders"},
+		{Tenant: "acme", Method: "GET", Path: "/api/echo/hello"},
+	} {
+		if _, err := s.Decide(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seen := view.seen()
+	if len(seen) == 0 {
+		t.Fatal("ownership was never resolved, so this test pins nothing")
+	}
+	for _, key := range seen {
+		if key != "acme" {
+			t.Fatalf("ownership was resolved for %q; it must be the bare tenant, or a tenant's requests split across shards", key)
+		}
 	}
 }

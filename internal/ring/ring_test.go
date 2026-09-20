@@ -250,10 +250,23 @@ func TestOwnershipDependsOnTheTenantAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner := r.Owner("acme").ID
-	for _, suffix := range []string{":per-minute", ":per-second", "/api/orders", ""} {
-		if got := r.Owner("acme" + suffix).ID; suffix == "" && got != owner {
-			t.Fatalf("the same tenant resolved to two owners")
+
+	// The ring hashes whatever key it is handed, so it cannot enforce this on
+	// its own -- what it CAN show is that a composed key resolves somewhere
+	// else, which is why the caller must never build one. If these ever agree,
+	// the assertion in internal/decide that pins the caller has stopped
+	// meaning anything.
+	moved := 0
+	for _, suffix := range []string{":per-minute", ":per-second", "/api/orders"} {
+		if r.Owner("acme"+suffix).ID != owner {
+			moved++
 		}
+	}
+	if moved == 0 {
+		t.Fatal("every composed key landed on the same node as the bare tenant, so this ring cannot demonstrate the difference the caller has to avoid")
+	}
+	if got := r.Owner("acme").ID; got != owner {
+		t.Fatalf("the same tenant resolved to two owners: %s then %s", owner, got)
 	}
 	// And the hash input is the bare key, which is what every node must agree
 	// on: a peer computing KeyHash("acme") must get this number.
